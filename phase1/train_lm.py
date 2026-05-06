@@ -43,7 +43,7 @@ from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 
 # Reuse the parts of Phase 0 that are vocabulary-agnostic.
-from train import LabelSmoothingLoss, NoamScheduler
+from ..phase0.train import LabelSmoothingLoss, NoamScheduler
 
 from decoder_only import GPT, GPTConfig
 
@@ -337,7 +337,7 @@ def main() -> None:
         d_model    = 256,
         n_heads    = 8,
         n_layers   = 6,
-        d_ff       = 1024,        # 4 * d_model (paper default; will become 8/3 in Phase 2d)
+        d_ff       = 1024,        
         max_len    = BLOCK_SIZE,
         dropout    = 0.1,
         pad_idx    = PAD_IDX,

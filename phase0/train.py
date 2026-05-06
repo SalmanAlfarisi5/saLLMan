@@ -1,10 +1,3 @@
-"""
-Phase 0 Training Script — German → English translation on Multi30k.
-Add this file alongside transformer.py. Run with: python train.py
-
-Dependencies:
-    pip install datasets
-"""
 from __future__ import annotations
 
 import math
@@ -42,7 +35,6 @@ _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 class Tokenizer:
     """
     Regex-based word tokenizer. Works for both German and English.
-    No model files, no internet required.
     """
     def tokenize_de(self, text: str) -> list[str]:
         return _TOKEN_RE.findall(text.lower())

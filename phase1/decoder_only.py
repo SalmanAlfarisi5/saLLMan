@@ -30,10 +30,6 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-# Reuse primitives from the vanilla transformer — they are unchanged.
-# A multi-head self-attention block is a multi-head self-attention block,
-# regardless of whether it lives in an encoder, an encoder-decoder, or a
-# decoder-only model. Same for the FFN and PE.
 from transformer import (
     MultiHeadAttention,
     PositionwiseFeedForward,
@@ -56,7 +52,7 @@ class GPTConfig:
     d_model: int = 512
     n_heads: int = 8
     n_layers: int = 6
-    d_ff: int = 2048           # 4 * d_model — will become 8/3 * d_model in Phase 2d (SwiGLU)
+    d_ff: int = 2048           # 4 * d_model 
     max_len: int = 1024        # GPT-2 used 1024; we'll keep this modest for an 8GB GPU
     dropout: float = 0.1
     pad_idx: int = 0
@@ -68,7 +64,6 @@ class GPTConfig:
 # ---------------------------------------------------------------------------
 # 2. Decoder-only block  (the central architectural change)
 # ---------------------------------------------------------------------------
-# Compare side-by-side with DecoderLayer in transformer.py:
 #
 #   ENCODER-DECODER DecoderLayer:        DECODER-ONLY GPTBlock:
 #     1) masked self-attn                  1) masked self-attn
@@ -94,7 +89,7 @@ class GPTBlock(nn.Module):
         # Sublayer 1: masked multi-head self-attention.
         # Q, K, V all come from x — there is no separate "memory" tensor.
         attn_out = self.self_attn(x, x, x, mask=attn_mask)
-        x = self.norm1(x + self.dropout1(attn_out))   # Post-LN (will flip to Pre-LN in Phase 2a)
+        x = self.norm1(x + self.dropout1(attn_out))   
         # Sublayer 2: position-wise feed-forward.
         ffn_out = self.ffn(x)
         x = self.norm2(x + self.dropout2(ffn_out))
@@ -114,9 +109,6 @@ class GPT(nn.Module):
     To train as a language model:
         input_ids = tokens[:-1]   # the model sees positions 0..T-1
         targets   = tokens[1:]    # and must predict positions 1..T at each step
-    This is the same teacher-forcing pattern you used in Phase 0, except now
-    `input_ids` and `targets` are slices of THE SAME sequence rather than
-    separate src/tgt tensors. This is the GPT next-token-prediction objective.
     """
 
     def __init__(self, cfg: GPTConfig) -> None:
@@ -133,12 +125,9 @@ class GPT(nn.Module):
         )
 
         # Output head: project hidden states to vocabulary logits.
-        # Named `lm_head` by convention (HuggingFace, GPT-2, LLaMA all use this name).
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
         # Weight tying: share weights between the input embedding and output projection.
-        # Same trick you used in Phase 0 (generator.weight = decoder.embed.weight).
-        # Cuts parameters by ~vocab_size * d_model and is standard in GPT-2/LLaMA.
         self.lm_head.weight = self.embed.weight
 
         self._init_params()

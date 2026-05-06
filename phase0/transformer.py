@@ -3,8 +3,6 @@ Transformer implementation following Vaswani et al. 2017,
 "Attention Is All You Need" (https://arxiv.org/abs/1706.03762).
 
 This is a from-scratch implementation emphasizing clarity over performance.
-For production use, swap scaled_dot_product_attention() for
-torch.nn.functional.scaled_dot_product_attention (fused FlashAttention kernel).
 """
 from __future__ import annotations
 
@@ -180,14 +178,8 @@ class PositionwiseFeedForward(nn.Module):
 class EncoderLayer(nn.Module):
     """
     Each encoder layer (Paper §3.1):
-        sublayer 1:  x + Dropout(MultiHeadSelfAttention(LayerNorm(x)))     ... see note
+        sublayer 1:  x + Dropout(MultiHeadSelfAttention(LayerNorm(x)))     
         sublayer 2:  x + Dropout(FFN(LayerNorm(x)))
-
-    NOTE ON POST-LN vs PRE-LN:
-    The original paper uses POST-LN: y = LayerNorm(x + Sublayer(x)).
-    Most modern implementations use PRE-LN: y = x + Sublayer(LayerNorm(x)),
-    which trains more stably without a learning-rate warmup.
-    I've coded POST-LN below to match the paper exactly (§5.4 residual dropout).
     """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1) -> None:
