@@ -30,6 +30,7 @@ Dependencies:
 from __future__ import annotations
 
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -38,15 +39,21 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
 
+# Ensure the project root is on sys.path so cross-phase imports work whether
+# this file is run directly (`python phase2/train_lm.py`) or imported.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 # Reuse data pipeline from Phase 1 trainer.
-from train_lm import (
+from phase1.train_lm import (
     PAD_IDX, BOS_IDX, EOS_IDX,
     BlockDataset, collate_blocks, load_wikitext2,
 )
 # Reuse label smoothing — it's vocabulary-agnostic.
-from train import LabelSmoothingLoss
+from phase0.train import LabelSmoothingLoss
 
-from decoder_only_v2 import GPTv2, GPTConfigV2
+from phase2.decoder_only import GPTv2, GPTConfigV2
 
 
 # ---------------------------------------------------------------------------

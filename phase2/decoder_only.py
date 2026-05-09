@@ -2,7 +2,7 @@
 saLLMan Phase 2 — Modernized decoder-only Transformer.
 
 Builds on Phase 1 (decoder_only.py) by applying the architectural improvements
-that every serious post-2020 decoder-only LM uses (LLaMA, Mistral, Qwen, GPT-NeoX,
+that every post-2020 decoder-only LM uses (LLaMA, Mistral, Qwen, GPT-NeoX,
 DeepSeek). Each change is annotated with the paper/reference that introduced it.
 
 PHASE 2 CHANGES
@@ -93,7 +93,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # Compute in fp32 even when x is bf16/fp16 — variance estimation is the
-        # one place norms can lose precision. LLaMA does this dance too.
+        # one place norms can lose precision. 
         dtype = x.dtype
         x_f32 = x.float()
         rms = x_f32.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()

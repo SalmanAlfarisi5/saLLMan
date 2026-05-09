@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -11,7 +12,15 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 
-from transformer import Transformer, TransformerConfig
+# Ensure the phase0 directory is on sys.path so `transformer` resolves
+# whether this file is run directly or imported from another phase.
+_PHASE0 = Path(__file__).resolve().parent
+_ROOT = _PHASE0.parent
+for _p in (_PHASE0, _ROOT):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from transformer import Transformer, TransformerConfig, make_pad_mask
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +408,6 @@ def greedy_decode(
     src = src.to(device)
 
     # Encode source once
-    from transformer import make_pad_mask
     src_mask = make_pad_mask(src, PAD_IDX)
     memory = model.encoder(src, src_mask)
 

@@ -24,13 +24,20 @@ Differences from the vanilla Transformer
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from transformer import (
+# Ensure the project root is on sys.path so phase0 is importable from anywhere.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from phase0.transformer import (
     MultiHeadAttention,
     PositionwiseFeedForward,
     PositionalEncoding,

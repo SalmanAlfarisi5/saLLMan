@@ -33,6 +33,7 @@ Dependencies:
 from __future__ import annotations
 
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -42,10 +43,18 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 
-# Reuse the parts of Phase 0 that are vocabulary-agnostic.
-from ..phase0.train import LabelSmoothingLoss, NoamScheduler
+# Ensure the project root and this phase directory are on sys.path so that
+# cross-phase imports work whether this file is run directly or imported.
+_PHASE1 = Path(__file__).resolve().parent
+_ROOT = _PHASE1.parent
+for _p in (_ROOT, _PHASE1):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
-from decoder_only import GPT, GPTConfig
+# Reuse the parts of Phase 0 that are vocabulary-agnostic.
+from phase0.train import LabelSmoothingLoss, NoamScheduler
+
+from phase1.decoder_only import GPT, GPTConfig
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +218,7 @@ def train_epoch(
     loss_fn: LabelSmoothingLoss,
     optimizer: torch.optim.Optimizer,
     scheduler: NoamScheduler,
-    scaler: "torch.amp.GradScaler | None",
+    use_amp: bool,
     device: torch.device,
     grad_clip: float = 1.0,
     log_every: int = 100,
@@ -217,7 +226,6 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     total_tokens = 0
-    use_amp = scaler is not None
 
     t0 = time.time()
     for step, (x, y) in enumerate(loader, start=1):
@@ -355,8 +363,7 @@ def main() -> None:
     loss_fn = LabelSmoothingLoss(vocab_size=vocab_size, pad_idx=PAD_IDX,
                                  smoothing=LABEL_SMOOTH)
 
-    # bf16 doesn't need a GradScaler; keeping the variable for symmetry.
-    scaler = "bf16" if use_amp else None  # marker; we don't actually scale
+    # bf16 doesn't need a GradScaler; just pass the flag directly.
 
     # ── Sample prompts to track generation quality ────────────────────────────
     sample_prompts = [
@@ -371,7 +378,7 @@ def main() -> None:
         print(f"\n=== Epoch {epoch}/{N_EPOCHS} ===")
         t0 = time.time()
         train_loss = train_epoch(model, train_loader, loss_fn, optimizer,
-                                 scheduler, scaler, device, GRAD_CLIP)
+                                 scheduler, use_amp, device, GRAD_CLIP)
         val_loss = evaluate(model, val_loader, loss_fn, device)
         elapsed = time.time() - t0
 
