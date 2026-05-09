@@ -149,6 +149,22 @@ from phase1.train_lm import BlockDataset, collate_blocks, load_wikitext2
 
 ---
 
+## Results
+
+Both phases trained on WikiText-2 (~2 M tokens), 5 epochs, same model size
+(~6.8 M parameters, d_model = 256, 6 layers, 8 heads), block size = 256.
+
+| Phase | Architecture | Best val loss | Perplexity |
+|-------|-------------|:-------------:|:----------:|
+| Phase 1 | GPT (Post-LN, sinusoidal PE, ReLU FFN, Noam LR) | 4.266 | 71.2 |
+| Phase 2 | LLaMA-style (Pre-LN, RMSNorm, RoPE, SwiGLU, cosine LR) | 4.161 | 64.1 |
+
+Phase 2 achieves **9.9 % lower perplexity** than Phase 1 at identical parameter
+count and training budget, attributable to the combined effect of Pre-LN
+training stability, RoPE's relative position encoding, and the SwiGLU gated FFN.
+
+---
+
 ## Key Design Decisions
 
 **Why separate phases instead of one configurable model?**
@@ -159,8 +175,8 @@ always visible.
 
 **Why WikiText-2 and not something bigger?**
 WikiText-2 (~2 M tokens) trains in minutes on a single GPU and is large
-enough to clearly distinguish architectures by perplexity. Phase 2 typically
-reaches ~20 % lower perplexity than Phase 1 at the same parameter count.
+enough to clearly distinguish architectures by perplexity. Phase 2 reaches
+~10 % lower perplexity than Phase 1 at the same parameter count (see Results).
 
 **Why label smoothing in Phase 2?**
 Kept for a fair comparison with Phase 1. Most production LMs use plain
