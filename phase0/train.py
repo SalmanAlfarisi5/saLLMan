@@ -20,6 +20,9 @@ for _p in (_PHASE0, _ROOT):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+from dotenv import load_dotenv
+load_dotenv(_ROOT / ".env")
+
 from transformer import Transformer, TransformerConfig, make_pad_mask
 
 

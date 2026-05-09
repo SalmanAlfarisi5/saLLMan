@@ -45,6 +45,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from dotenv import load_dotenv
+load_dotenv(_ROOT / ".env")
+
 # Reuse data pipeline from Phase 1 trainer.
 from phase1.train_lm import (
     PAD_IDX, BOS_IDX, EOS_IDX,

@@ -51,6 +51,9 @@ for _p in (_ROOT, _PHASE1):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+from dotenv import load_dotenv
+load_dotenv(_ROOT / ".env")
+
 # Reuse the parts of Phase 0 that are vocabulary-agnostic.
 from phase0.train import LabelSmoothingLoss, NoamScheduler
 
