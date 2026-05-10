@@ -1,4 +1,4 @@
-from phase0.transformer import (
+from .transformer import (
     TransformerConfig,
     PositionalEncoding,
     MultiHeadAttention,

@@ -60,7 +60,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from phase3.decoder_only_v3 import GPTv3, GPTConfigV3
+from decoder_only_v3 import GPTv3, GPTConfigV3
 
 
 # ===========================================================================

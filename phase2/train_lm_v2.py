@@ -56,7 +56,7 @@ from phase1.train_lm import (
 # Reuse label smoothing — it's vocabulary-agnostic.
 from phase0.train import LabelSmoothingLoss
 
-from phase2.decoder_only import GPTv2, GPTConfigV2
+from phase2.decoder_only_v2 import GPTv2, GPTConfigV2
 
 
 # ---------------------------------------------------------------------------

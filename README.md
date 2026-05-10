@@ -18,8 +18,8 @@ saLLMan/
 │   ├── decoder_only.py     Model (reuses phase0 primitives)
 │   └── train_lm.py         WikiText-2 language modelling
 ├── phase2/                 LLaMA-class modernised decoder
-│   ├── decoder_only.py     Self-contained model
-│   └── train_lm.py         AdamW + cosine LR + KV-cache
+│   ├── decoder_only_v2.py  Self-contained model
+│   └── train_lm_v2.py      AdamW + cosine LR + KV-cache
 └── phase3/                 75M-param code LM
     ├── decoder_only_v3.py  GPTv3 (adds gradient checkpointing)
     ├── data_prep.py        Tokeniser training + binary corpus

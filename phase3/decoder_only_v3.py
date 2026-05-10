@@ -44,7 +44,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 # Reuse Phase 2 building blocks — only the top-level model class changes.
-from phase2.decoder_only import (
+from phase2.decoder_only_v2 import (
     GPTConfigV2,
     RMSNorm,
     TransformerBlock,
