@@ -1,5 +1,5 @@
 """
-saLLMan Phase 3 — Pretraining loop for the 75M-param decoder-only LM.
+saLLMan Phase 3 — Pretraining loop for the 46.7M-param decoder-only LM.
 
 Trains GPTv3 on the code+DSA corpus prepared by data_prep.py. Designed
 for a single 8GB GPU (RTX 3060 Ti) and runs that may span many hours
@@ -21,9 +21,9 @@ Features
 7. Cosine LR with linear warmup, configured by total_steps.
 8. JSONL training log for later plotting.
 
-Recipe summary (all standard for ~75M-param LMs at this scale)
+Recipe summary (all standard for ~46.7M-param LMs at this scale)
 --------------------------------------------------------------
-  d_model=512, n_heads=8, n_layers=12 → ~75M params
+  d_model=512, n_heads=8, n_layers=12 → ~46.7M params
   block_size=512, micro_batch=4, accum=16 → effective batch=64, 32k tokens/step
   max_lr=3e-4, min_lr=3e-5, weight_decay=0.1
   total_steps=20000 → ~640M tokens seen (~3-4x the dataset for some repetition)
@@ -73,9 +73,9 @@ class TrainConfig:
     data_dir: str = "pretrain_data"
 
     # ── Model ────────────────────────────────────────────────────────────────
-    # 75M-param recipe. Roughly:
+    # 46.7M-param recipe. Roughly:
     #   embed(vocab*d) + 12 * (4*d^2 attn + 3*d*d_ff ffn) + final norm
-    #   = 16k*512 + 12*(4*512^2 + 3*512*1408) ≈ 8M + 67M ≈ 75M
+    #   = 16k*512 + 12*(4*512^2 + 3*512*1408) ≈ 8M + 38.7M ≈ 46.7M
     d_model: int = 512
     n_heads: int = 8
     n_layers: int = 12

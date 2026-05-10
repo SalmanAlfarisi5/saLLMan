@@ -8,7 +8,7 @@ of storing them.
 
 Why gradient checkpointing matters for an 8GB GPU
 -------------------------------------------------
-Activation memory scales as O(n_layers * batch * seq_len * d_model). At 75M
+Activation memory scales as O(n_layers * batch * seq_len * d_model). At 46.7M
 params with d_model=512, n_layers=12, block_size=1024, batch=4, this can
 easily blow past 6GB just for activations. Checkpointing trades ~30% extra
 compute for a roughly 4-5x reduction in activation memory by storing only

@@ -20,7 +20,7 @@ saLLMan/
 ├── phase2/                 LLaMA-class modernised decoder
 │   ├── decoder_only_v2.py  Self-contained model
 │   └── train_lm_v2.py      AdamW + cosine LR + KV-cache
-└── phase3/                 75M-param code LM
+└── phase3/                 46.7M-param code LM
     ├── decoder_only_v3.py  GPTv3 (adds gradient checkpointing)
     ├── data_prep.py        Tokeniser training + binary corpus
     └── pretrain.py         Full pretraining loop with resume
@@ -41,7 +41,7 @@ saLLMan/
 | **LR schedule** | Noam | Noam | Cosine warmup | Cosine warmup |
 | **Optimizer** | Adam | Adam | AdamW | AdamW (fused) |
 | **Loss** | Label smoothing | Label smoothing | Label smoothing | Cross-entropy |
-| **Params** | ~8M | ~6.8M | ~6.8M | ~75M |
+| **Params** | ~8M | ~6.8M | ~6.8M | ~46.7M |
 
 ### Phase 0 — Vanilla Transformer
 
@@ -76,7 +76,7 @@ the Phase 1 architecture:
 
 ### Phase 3 — Production-scale Code LM
 
-Scales to 75M parameters and shifts domain to Python code. Built on the Phase 2
+Scales to 46.7M parameters and shifts domain to Python code. Built on the Phase 2
 architecture with one addition: **gradient checkpointing** (Chen et al. 2016)
 — recomputes activations during backward instead of storing them, trading ~30%
 extra compute for ~4–5× less peak activation memory. Essential at this scale on
@@ -194,7 +194,7 @@ WikiText-2, 5 epochs, ~6.8M params (d_model=256, 6 layers, 8 heads), block=256.
 Phase 2 achieves **9.9% lower perplexity** at identical parameter count and
 training budget — attributable to Pre-LN stability, RoPE, and SwiGLU combined.
 
-Phase 3 (75M params, code corpus, 20k steps): training in progress.
+Phase 3 (46.7M params, code corpus, 20k steps): training in progress.
 
 ---
 
