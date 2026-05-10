@@ -43,6 +43,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -54,7 +55,12 @@ import torch.nn.functional as F
 from torch import Tensor
 from tokenizers import Tokenizer
 
-from phase3.decoder_only import GPTv3, GPTConfigV3
+# Ensure project root is on sys.path so cross-phase imports work from anywhere.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from phase3.decoder_only_v3 import GPTv3, GPTConfigV3
 
 
 # ===========================================================================

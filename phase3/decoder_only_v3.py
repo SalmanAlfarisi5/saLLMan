@@ -27,22 +27,29 @@ no_grad anyway), so it's safe to leave on always.
 """
 from __future__ import annotations
 
+import math
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
-# We reuse everything from v2 except the top-level model class.
-from decoder_only_v2 import (
+# Ensure project root is on sys.path so phase2 is importable from anywhere.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+# Reuse Phase 2 building blocks — only the top-level model class changes.
+from phase2.decoder_only import (
     GPTConfigV2,
     RMSNorm,
     TransformerBlock,
     precompute_rope_cache,
 )
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 
 @dataclass

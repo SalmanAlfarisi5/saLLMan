@@ -1,300 +1,328 @@
 """
-saLLMan Phase 3 — Data preparation for code+DSA pretraining.
+saLLMan Phase 3a — Data preparation for pretraining.
 
-This script does two things and saves the results to disk:
+Produces the four files in <out_dir>/ that pretrain.py expects:
+  - bpe_tokenizer.json   byte-level BPE, vocab=16000, specials at ids 0..3
+  - train.bin            uint16 tokens (concatenated docs, <eos> between docs)
+  - val.bin              same, ~0.5 % of documents
+  - meta.json            vocab_size, token counts, special token ids, sources
 
-  1. Trains a fresh byte-level BPE tokenizer (16k vocab) on a sample of the
-     pretraining corpus. The WikiText BPE from Phase 1/2 is unsuitable for
-     code — it spends vocab on natural-language whitespace patterns and
-     fragments common Python tokens (`def`, `self`, `range`) into pieces.
+Phase 3a covers ONE source: bigcode/the-stack-smol Python (10k files, ~24M tokens).
+Phase 3b will extend with CodeForces problems + submissions in a separate script.
 
-  2. Tokenizes the entire pretraining corpus and writes it to disk as a
-     single binary uint16 array per split (train/val). This is the
-     "nanoGPT pattern": one giant memory-mapped token blob, then chop into
-     blocks at training time. Vastly faster than re-tokenizing every epoch.
+Lessons baked into this implementation (see Phase 3 handoff):
+  L1 — datasets >= 4.0 dropped script-based loaders. We bypass entirely by
+       downloading a single file with hf_hub_download and loading it as a
+       generic JSON dataset, never invoking the repo's loader script.
+  L4 — the-stack-smol's data_dir / data_files config keys are fragile. The
+       robust pattern is hf_hub_download → load_dataset("json", data_files=…).
+  L5 — schema verified live (2026-05-10): rows=10000, columns include
+       'content' (the code), 'repository_name', 'path', 'lang', 'licenses', …
+  L6 — the-stack-smol layout is data/{lang}/data.json (single JSON), NOT
+       data/{lang}/*.parquet shards. The handoff's parquet glob was wrong.
 
-Datasets used (all permissively licensed, all on HuggingFace Hub)
------------------------------------------------------------------
-  - bigcode/the-stack-smol (data/python)        ~10k Python files
-  - code_search_net (python config)             ~450k function+docstring pairs
-  - codeparrot/apps                              10k algorithmic problems
+References:
+  - Sennrich et al. 2016, "Neural Machine Translation of Rare Words with
+    Subword Units" (BPE) — https://arxiv.org/abs/1508.07909
+  - Radford et al. 2019, GPT-2 (byte-level BPE) — https://cdn.openai.com/
+    better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+  - Karpathy nanoGPT (memory-mapped uint16 token arrays) —
+    https://github.com/karpathy/nanoGPT/blob/master/data/openwebtext/prepare.py
 
-Why this mix:
-  - the-stack-smol gives general high-quality Python code (the bulk).
-  - CodeSearchNet pairs natural-language docstrings with code — the model
-    learns to associate problem descriptions with implementations.
-  - APPS gives explicit "natural-language problem → Python solution" pairs,
-    which is exactly the saLLMan target distribution.
-
-We deliberately do NOT use:
-  - The full Stack — overkill for a 75M model on a 3060 Ti, and the streaming
-    loader has known issues (HF datasets #7467).
-  - LeetCode/USACO/Codeforces here — those are PHASE 3 fine-tuning data, run
-    separately after pretraining.
-
-Output files (in ./pretrain_data/)
-----------------------------------
-  bpe_tokenizer.json     trained tokenizer
-  train.bin              uint16 array of training tokens (memory-mappable)
-  val.bin                uint16 array of validation tokens
-  meta.json              {vocab_size, n_train_tokens, n_val_tokens, ...}
-
-Dependencies:
-    pip install datasets tokenizers tqdm numpy
+Usage:
+    python data_prep.py [--out pretrain_data] [--vocab-size 16000]
+                        [--val-ratio 0.005] [--seed 42]
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import random
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
-from dotenv import load_dotenv
-from datasets import load_dataset
-
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+from datasets import Dataset, load_dataset
+from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.trainers import BpeTrainer
 from tqdm import tqdm
 
 
-OUT_DIR = Path("pretrain_data")
-OUT_DIR.mkdir(exist_ok=True)
-
-# Special tokens — same ids as Phase 1/2 for consistency across the project.
-SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
+# ---------------------------------------------------------------------------
+# Special tokens — order = ids 0..3.  pretrain.py depends on these IDs.
+# ---------------------------------------------------------------------------
+SPECIAL_TOKENS: list[str] = ["<pad>", "<bos>", "<eos>", "<unk>"]
 PAD_IDX, BOS_IDX, EOS_IDX, UNK_IDX = 0, 1, 2, 3
-VOCAB_SIZE = 16000        # 2x the Phase 1/2 vocab — code has more "words"
-VAL_FRACTION = 0.005      # 0.5% — enough for a stable PPL estimate, leave the rest for training
-SEED = 42
+
+# Source identifier (also written into meta.json)
+SOURCE_NAME: str = "bigcode/the-stack-smol:python"
+HF_REPO: str = "bigcode/the-stack-smol"
+HF_FILE: str = "data/python/data.json"
 
 
-# ===========================================================================
-# 1. Source iterators — yield raw text strings from each dataset.
-# ===========================================================================
-# Each iterator yields document-level strings. We'll separate documents with
-# <eos> when we tokenize and concatenate. A "document" here is one Python file,
-# one (docstring, code) pair, or one (problem, solution) pair.
-
-def iter_the_stack_smol() -> Iterator[str]:
-    """Python files from bigcode/the-stack-smol. ~10k files."""
-    print("Loading the-stack-smol (Python)...")
-    ds = load_dataset("bigcode/the-stack-smol", data_dir="data/python", split="train")
-    for ex in ds:
-        # Light cleanup: skip extremely short or extremely long files.
-        # Extremely short = probably auto-generated stubs.
-        # Extremely long = often minified, generated, or test fixtures.
-        content = ex["content"]
-        if 100 <= len(content) <= 50_000:
-            yield content
-
-
-def iter_code_search_net() -> Iterator[str]:
+# ---------------------------------------------------------------------------
+# 1. Load source data
+# ---------------------------------------------------------------------------
+def load_stack_smol_python() -> Dataset:
     """
-    Python (docstring, code) pairs from CodeSearchNet. We format each as:
-        \"\"\"<docstring>\"\"\"
-        <code>
-    so the model sees natural-language → code pattern in its training data.
+    Download data/python/data.json from bigcode/the-stack-smol and load it
+    as a HF Dataset.
+
+    The hf_hub_download → load_dataset("json", ...) pattern bypasses both
+    the deprecated script loader (L1) and the data_dir/data_files config
+    indirection that broke in earlier iterations (L4).
     """
-    print("Loading code_search_net (Python)...")
-    # CodeSearchNet has train/valid/test splits — concatenate train + valid
-    # since we make our own val split below.
-    ds = load_dataset("code_search_net", "python", split="train",
-                      trust_remote_code=True)
-    for ex in ds:
-        doc = (ex.get("func_documentation_string") or "").strip()
-        code = (ex.get("func_code_string") or "").strip()
-        if not code:
-            continue
-        if doc:
-            text = f'"""\n{doc}\n"""\n{code}\n'
-        else:
-            text = code + "\n"
-        if 50 <= len(text) <= 10_000:
-            yield text
+    print(f"[1/5] Downloading {HF_REPO}:{HF_FILE} ...")
+    local_path = hf_hub_download(HF_REPO, filename=HF_FILE, repo_type="dataset")
+    print(f"      cached at: {local_path}")
+    print(f"      size: {os.path.getsize(local_path) / 1e6:.1f} MB")
+
+    ds = load_dataset("json", data_files=local_path, split="train")
+
+    # Defensive schema check (L5). If 'content' disappears we want a clear
+    # error pointing at the actual columns, not 0 silent results downstream.
+    if "content" not in ds.column_names:
+        sample_keys = list(ds[0].keys()) if len(ds) > 0 else []
+        raise RuntimeError(
+            f"Expected 'content' column in {SOURCE_NAME}; got columns "
+            f"{ds.column_names}. First-row keys: {sample_keys}. "
+            "If the dataset schema changed, update HF_FILE or the column name."
+        )
+
+    print(f"      rows: {len(ds):,}")
+    print(f"      columns: {ds.column_names}")
+    return ds
 
 
-def iter_apps() -> Iterator[str]:
+# ---------------------------------------------------------------------------
+# 2. Train byte-level BPE
+# ---------------------------------------------------------------------------
+def train_bpe(docs: list[str], vocab_size: int) -> Tokenizer:
     """
-    APPS problems formatted as:
-        # Problem
-        <question>
-        # Solution
-        <solution>
-    For problems with multiple solutions, we pick one at random per problem
-    so we don't oversample any single problem.
+    Byte-level BPE following GPT-2 / LLaMA conventions.
+
+    Why byte-level
+    --------------
+    Code contains arbitrary Unicode (string literals, comments) and unusual
+    whitespace. Byte-level BPE has a closed alphabet of 256 bytes and never
+    produces <unk>, which matters for code where any character is potentially
+    semantically meaningful.
+
+    Why add_prefix_space=False
+    --------------------------
+    GPT-2 uses add_prefix_space=True so 'Hello' and ' Hello' are merged into
+    one token type. For code, leading whitespace is structurally meaningful
+    (Python indentation!) so we keep prefixes literal.
     """
-    print("Loading codeparrot/apps...")
-    ds = load_dataset("codeparrot/apps", split="train", trust_remote_code=True)
-    rng = random.Random(SEED)
-    for ex in ds:
-        question = ex["question"].strip()
-        solutions_raw = ex.get("solutions") or ""
-        if not solutions_raw:
-            continue
-        try:
-            solutions = json.loads(solutions_raw)
-        except json.JSONDecodeError:
-            continue
-        if not solutions:
-            continue
-        sol = rng.choice(solutions)
-        text = f"# Problem\n{question}\n\n# Solution\n{sol}\n"
-        yield text
-
-
-def iter_all_documents() -> Iterator[str]:
-    """Concatenates all sources. Order doesn't matter — we shuffle blocks later."""
-    yield from iter_the_stack_smol()
-    yield from iter_code_search_net()
-    yield from iter_apps()
-
-
-# ===========================================================================
-# 2. Train BPE tokenizer
-# ===========================================================================
-def train_tokenizer(sample_size: int = 200_000) -> Tokenizer:
-    """
-    Train byte-level BPE on a sample of documents. Sampling rather than using
-    every document because tokenizer training memory scales with corpus size
-    and the marginal benefit beyond ~200k documents is negligible.
-    """
-    tok_path = OUT_DIR / "bpe_tokenizer.json"
-    if tok_path.exists():
-        print(f"Loading cached tokenizer from {tok_path}")
-        return Tokenizer.from_file(str(tok_path))
-
-    print(f"Sampling up to {sample_size:,} documents for tokenizer training...")
-    samples: list[str] = []
-    for i, doc in enumerate(iter_all_documents()):
-        if i >= sample_size:
-            break
-        samples.append(doc)
-    print(f"Got {len(samples):,} sample documents")
+    print(
+        f"[2/5] Training byte-level BPE (vocab_size={vocab_size}) on "
+        f"{len(docs):,} docs ..."
+    )
 
     tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-    # add_prefix_space=False: code lines often start without a leading space,
-    # and we don't want to artificially insert one.
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = ByteLevelDecoder()
+
     trainer = BpeTrainer(
-        vocab_size=VOCAB_SIZE,
-        special_tokens=SPECIAL_TOKENS,    # order = id 0,1,2,3
-        # Pre-add common code tokens that BPE might miss as standalone units.
-        # These hint to BPE: "consider keeping these whole".
-        initial_alphabet=ByteLevel.alphabet(),
+        vocab_size=vocab_size,
+        special_tokens=SPECIAL_TOKENS,            # order is preserved → ids 0..3
+        initial_alphabet=ByteLevel.alphabet(),    # seed all 256 byte chars
         show_progress=True,
     )
-    print(f"Training BPE (target vocab={VOCAB_SIZE})...")
-    tokenizer.train_from_iterator(samples, trainer=trainer, length=len(samples))
-    tokenizer.save(str(tok_path))
-    print(f"Saved tokenizer to {tok_path}")
+
+    def iter_docs() -> Iterator[str]:
+        for d in docs:
+            yield d
+
+    tokenizer.train_from_iterator(iter_docs(), trainer=trainer, length=len(docs))
+
+    # Verify special-token ids are exactly 0..3 (pretrain.py depends on this).
+    for name, expected in zip(SPECIAL_TOKENS, range(len(SPECIAL_TOKENS))):
+        got = tokenizer.token_to_id(name)
+        if got != expected:
+            raise RuntimeError(
+                f"Special token {name!r} got id {got}, expected {expected}. "
+                "BpeTrainer special-token ordering may have changed."
+            )
+    print(f"      vocab size: {tokenizer.get_vocab_size():,}")
+    print(
+        f"      special token ids verified: "
+        f"{[(t, tokenizer.token_to_id(t)) for t in SPECIAL_TOKENS]}"
+    )
     return tokenizer
 
 
-# ===========================================================================
-# 3. Tokenize and pack to disk
-# ===========================================================================
-def tokenize_and_pack(tokenizer: Tokenizer) -> tuple[int, int]:
+# ---------------------------------------------------------------------------
+# 3. Tokenize and pack into a uint16 array
+# ---------------------------------------------------------------------------
+def tokenize_split(
+    tokenizer: Tokenizer,
+    docs: list[str],
+    desc: str,
+) -> np.ndarray:
     """
-    Tokenize every document, separated by <eos>, and write the resulting
-    token stream to disk as uint16 binary files (train.bin, val.bin).
+    Encode each document, append <eos>, and concatenate into a 1-D uint16
+    array. Returns shape (n_total_tokens,).
 
-    We use uint16 because vocab=16000 < 65535 → fits in 2 bytes per token,
-    half the disk and memory of int32. nanoGPT uses this trick.
+    Document boundaries: <eos> after each doc; no <bos> between docs (BOS is
+    only used at the start of a generation prompt, per the handoff).
 
-    Splitting into train/val: we sample a small random fraction of DOCUMENTS
-    (not tokens) to be validation. Doing it at document granularity prevents
-    leakage of context across the split boundary.
+    uint16 is safe iff vocab_size <= 65535 — asserted below.
     """
-    train_path = OUT_DIR / "train.bin"
-    val_path   = OUT_DIR / "val.bin"
-    if train_path.exists() and val_path.exists():
-        n_train = train_path.stat().st_size // 2
-        n_val   = val_path.stat().st_size // 2
-        print(f"Found existing token files: train={n_train:,}, val={n_val:,}")
-        return n_train, n_val
+    if tokenizer.get_vocab_size() > np.iinfo(np.uint16).max:
+        raise ValueError(
+            f"vocab_size={tokenizer.get_vocab_size()} exceeds uint16 range "
+            f"({np.iinfo(np.uint16).max}); switch dtype to uint32 here AND "
+            "in pretrain.py's np.memmap call."
+        )
 
-    rng = random.Random(SEED)
-    # We accumulate tokens in chunks then write to disk in append mode to
-    # keep peak memory bounded. Each chunk is up to ~10M tokens (~20MB each).
-    CHUNK_TOKENS = 10_000_000
+    # encode_batch is the fast Rust path. We chunk it to bound peak memory
+    # and to get a meaningful progress bar.
+    chunk_size = 1024
+    pieces: list[np.ndarray] = []
+    n_tokens = 0
 
-    train_buf: list[int] = []
-    val_buf:   list[int] = []
-    n_train_total = 0
-    n_val_total = 0
+    for i in tqdm(range(0, len(docs), chunk_size), desc=desc):
+        batch = docs[i : i + chunk_size]
+        encs = tokenizer.encode_batch(batch)
+        for enc in encs:
+            ids = enc.ids
+            ids.append(EOS_IDX)                                 # doc separator
+            arr = np.asarray(ids, dtype=np.uint16)
+            pieces.append(arr)
+            n_tokens += len(arr)
 
-    # Open output files in append-binary mode. We'll write chunks as they fill.
-    train_f = open(train_path, "wb")
-    val_f   = open(val_path,   "wb")
-
-    def flush(buf: list[int], f) -> int:
-        if not buf:
-            return 0
-        arr = np.asarray(buf, dtype=np.uint16)
-        f.write(arr.tobytes())
-        f.flush()
-        return arr.size
-
-    try:
-        for doc in tqdm(iter_all_documents(), desc="Tokenizing"):
-            ids = tokenizer.encode(doc).ids
-            ids.append(EOS_IDX)   # document boundary marker
-
-            # Route this document's tokens to train or val.
-            if rng.random() < VAL_FRACTION:
-                val_buf.extend(ids)
-                if len(val_buf) >= CHUNK_TOKENS:
-                    n_val_total += flush(val_buf, val_f)
-                    val_buf.clear()
-            else:
-                train_buf.extend(ids)
-                if len(train_buf) >= CHUNK_TOKENS:
-                    n_train_total += flush(train_buf, train_f)
-                    train_buf.clear()
-
-        # Final flush of remaining buffers.
-        n_train_total += flush(train_buf, train_f)
-        n_val_total   += flush(val_buf,   val_f)
-    finally:
-        train_f.close()
-        val_f.close()
-
-    print(f"Wrote train.bin: {n_train_total:,} tokens ({n_train_total * 2 / 1e6:.1f} MB)")
-    print(f"Wrote val.bin:   {n_val_total:,} tokens ({n_val_total * 2 / 1e6:.1f} MB)")
-    return n_train_total, n_val_total
+    out = np.concatenate(pieces, dtype=np.uint16)
+    assert out.shape == (n_tokens,)
+    return out
 
 
-# ===========================================================================
-# 4. Main
-# ===========================================================================
-def main() -> None:
-    random.seed(SEED)
-    np.random.seed(SEED)
+# ---------------------------------------------------------------------------
+# 4. Output writers
+# ---------------------------------------------------------------------------
+def write_bin(arr: np.ndarray, path: Path) -> None:
+    """Write a 1-D uint16 array as raw bytes (memory-mappable, no header)."""
+    assert arr.dtype == np.uint16, f"expected uint16, got {arr.dtype}"
+    arr.tofile(path)
 
-    tokenizer = train_tokenizer()
-    actual_vocab = tokenizer.get_vocab_size()
-    print(f"Tokenizer vocab size: {actual_vocab}")
 
-    n_train, n_val = tokenize_and_pack(tokenizer)
-
+def write_meta(
+    out_dir: Path,
+    vocab_size: int,
+    n_train: int,
+    n_val: int,
+) -> None:
+    """Schema must match what pretrain.py reads — see handoff doc."""
     meta = {
-        "vocab_size":     actual_vocab,
+        "vocab_size":     vocab_size,
         "n_train_tokens": n_train,
         "n_val_tokens":   n_val,
-        "pad_idx": PAD_IDX, "bos_idx": BOS_IDX, "eos_idx": EOS_IDX, "unk_idx": UNK_IDX,
-        "datasets": [
-            "bigcode/the-stack-smol (python)",
-            "code_search_net (python)",
-            "codeparrot/apps (train)",
-        ],
+        "pad_idx":        PAD_IDX,
+        "bos_idx":        BOS_IDX,
+        "eos_idx":        EOS_IDX,
+        "unk_idx":        UNK_IDX,
+        "datasets":       [SOURCE_NAME],
     }
-    (OUT_DIR / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"\nWrote {OUT_DIR / 'meta.json'}")
-    print(json.dumps(meta, indent=2))
+    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# 5. Verify outputs (handoff requirement #3)
+# ---------------------------------------------------------------------------
+def verify_outputs(out_dir: Path, tokenizer: Tokenizer, n_preview: int = 100) -> None:
+    """Memory-map train.bin and decode the first N tokens for a sanity check."""
+    arr = np.memmap(out_dir / "train.bin", dtype=np.uint16, mode="r")
+    print(f"\n[5/5] Verifying train.bin: {len(arr):,} tokens (memory-mapped)")
+    head = arr[:n_preview].tolist()
+    print(f"      first {n_preview} ids head/tail: {head[:10]} ... {head[-5:]}")
+    print(f"      decoded preview:")
+    print("      " + "-" * 60)
+    decoded = tokenizer.decode(head)
+    for line in decoded.split("\n"):
+        print(f"      | {line}")
+    print("      " + "-" * 60)
+
+
+# ---------------------------------------------------------------------------
+# 6. Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Phase 3a data prep: the-stack-smol Python → train.bin/val.bin."
+    )
+    parser.add_argument("--out", type=Path, default=Path("pretrain_data"))
+    parser.add_argument("--vocab-size", type=int, default=16000)
+    parser.add_argument(
+        "--val-ratio", type=float, default=0.005,
+        help="Fraction of documents held out for validation (default 0.5%%)",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {args.out.resolve()}\n")
+
+    # ── 1. Load ───────────────────────────────────────────────────────────────
+    ds = load_stack_smol_python()
+    docs: list[str] = list(ds["content"])
+
+    # ── 2. Document-level train/val split ─────────────────────────────────────
+    # Splitting at document granularity (not token granularity) avoids leaking
+    # the start of a held-out doc into the train tail, which would make val
+    # loss artificially low.
+    rng = random.Random(args.seed)
+    indices = list(range(len(docs)))
+    rng.shuffle(indices)
+    n_val = max(1, int(len(docs) * args.val_ratio))
+    val_idx = set(indices[:n_val])
+    train_docs = [docs[i] for i in range(len(docs)) if i not in val_idx]
+    val_docs   = [docs[i] for i in range(len(docs)) if i in val_idx]
+    print(
+        f"      split: {len(train_docs):,} train docs / "
+        f"{len(val_docs):,} val docs  (seed={args.seed})"
+    )
+
+    # ── 3. Train BPE on TRAIN docs only ──────────────────────────────────────
+    # Training the tokenizer on val docs would technically leak val statistics
+    # into the model's vocabulary. The cost of excluding 50 docs is negligible.
+    tokenizer = train_bpe(train_docs, vocab_size=args.vocab_size)
+    tokenizer.save(str(args.out / "bpe_tokenizer.json"))
+    print(f"      saved tokenizer to {args.out / 'bpe_tokenizer.json'}")
+
+    # ── 4. Tokenize and write bins ────────────────────────────────────────────
+    print("[3/5] Tokenizing splits ...")
+    train_arr = tokenize_split(tokenizer, train_docs, desc="train")
+    val_arr   = tokenize_split(tokenizer, val_docs,   desc="val  ")
+    print(f"      train tokens: {len(train_arr):,}")
+    print(f"      val tokens:   {len(val_arr):,}")
+    print(
+        f"      train/val ratio: {len(train_arr)/(len(val_arr) or 1):.1f}x  "
+        f"(target: ~{1/args.val_ratio:.0f}x)"
+    )
+
+    print("[4/5] Writing bins + meta.json ...")
+    write_bin(train_arr, args.out / "train.bin")
+    write_bin(val_arr,   args.out / "val.bin")
+    write_meta(
+        args.out,
+        vocab_size=tokenizer.get_vocab_size(),
+        n_train=len(train_arr),
+        n_val=len(val_arr),
+    )
+    print(f"      train.bin: {(args.out / 'train.bin').stat().st_size / 1e6:.1f} MB")
+    print(f"      val.bin:   {(args.out / 'val.bin').stat().st_size / 1e6:.1f} MB")
+    print(f"      meta.json written")
+
+    # ── 5. Verify ─────────────────────────────────────────────────────────────
+    verify_outputs(args.out, tokenizer)
+
+    print("\nDone. Next step:")
+    print("    python pretrain.py")
 
 
 if __name__ == "__main__":
