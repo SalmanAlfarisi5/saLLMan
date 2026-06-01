@@ -1,38 +1,62 @@
 """
-saLLMan Phase 3 — Pretraining loop for the 46.7M-param decoder-only LM.
+saLLMan Phase 3 — Pretraining loop for the ~97M-param decoder-only LM.
 
 Trains GPTv3 on the code+DSA corpus prepared by data_prep.py. Designed
 for a single 8GB GPU (RTX 3060 Ti) and runs that may span many hours
 or multiple sessions.
 
-Features
---------
-1. Memory-mapped binary token files (train.bin, val.bin from data_prep.py)
-   — zero-copy, instant startup, scales to billions of tokens with no RAM cost.
-2. Random window sampling — instead of iterating sequentially, each training
-   step samples a random offset into the token stream. This gives effectively
-   infinite shuffling without the overhead of materializing block indices.
-   Standard nanoGPT pattern.
-3. Gradient accumulation — simulate larger effective batch size than fits in VRAM.
-4. Gradient checkpointing — toggle when activations don't fit.
-5. bf16 mixed precision — same as Phase 2.
-6. Step-level checkpointing with full resume:
-     model state, optimizer state, scheduler step, RNG state, training step.
-7. Cosine LR with linear warmup, configured by total_steps.
-8. JSONL training log for later plotting.
+What changed from the 46.7M baseline
+------------------------------------
+The previous default produced a clearly-overfit checkpoint (train PPL=1.34
+vs val PPL=68 at step 20k). Two root causes: (a) the corpus was ~22M tokens
+trained for ~28 epochs, (b) the model was undersized for any sensible
+fine-tuning target. v2 addresses both:
 
-Recipe summary (all standard for ~46.7M-param LMs at this scale)
---------------------------------------------------------------
-  d_model=512, n_heads=8, n_layers=12 → ~46.7M params
-  block_size=512, micro_batch=4, accum=16 → effective batch=64, 32k tokens/step
+  Architecture target:  ~97M params (d_model=768, n_heads=12, n_layers=12,
+                        SwiGLU d_ff=2048). Still fits comfortably on 8GB
+                        VRAM at micro_batch=4 / seq=512 without gradient
+                        checkpointing.
+  Data target:          ~2B tokens from bigcode/the-stack-dedup data/python,
+                        prepared by the rewritten data_prep.py — close to
+                        Chinchilla optimum (20 tokens/param) for this size.
+  Schedule:             total_steps 20k → 60k, warmup 1k → 2k.
+
+The architecture file (decoder_only_v3.py) didn't need to change — every
+new knob is already exposed by GPTConfigV3.
+
+Features (unchanged from the smol-baseline pipeline)
+----------------------------------------------------
+1. Memory-mapped binary token files — zero-copy, instant startup, scales to
+   billions of tokens with no RAM cost.
+2. Random window sampling — each step samples random offsets into the token
+   stream. Implicit infinite shuffle. Standard nanoGPT pattern.
+3. Gradient accumulation — simulate larger effective batch size than fits
+   in VRAM.
+4. Gradient checkpointing — toggle when activations don't fit.
+5. bf16 mixed precision.
+6. Step-level checkpointing with full resume: model, optimizer, scheduler,
+   RNG, step.
+7. Cosine LR with linear warmup.
+8. JSONL training log.
+
+Recipe summary
+--------------
+  d_model=768, n_heads=12, n_layers=12 → ~97M params
+  block_size=512, micro_batch=4, accum=16 → effective batch=64, 32k tok/step
   max_lr=3e-4, min_lr=3e-5, weight_decay=0.1
-  total_steps=20000 → ~640M tokens seen (~3-4x the dataset for some repetition)
+  total_steps=60000 → ~1.97B tokens seen (~1 epoch of a 2B corpus)
+
+Wall-clock estimate (RTX 3060 Ti)
+---------------------------------
+At ~36k tok/s with the 46.7M model we saw ~10h for 20k steps. The 97M
+target is ~2x more FLOPs per step; expect ~40-50 hours for 60k steps.
+Use --total_steps to scale up or down for shorter experiments.
 
 Dependencies:
     pip install tokenizers numpy
 
 Run:
-    python data_prep.py        # one-time, ~30-60 min depending on bandwidth
+    python data_prep.py        # one-time, builds pretrain_data_v2/ (~hours)
     python pretrain.py         # the long run
     python pretrain.py --resume    # picks up from last checkpoint
 """
@@ -70,16 +94,20 @@ from decoder_only_v3 import GPTv3, GPTConfigV3
 @dataclass
 class TrainConfig:
     # ── Data ─────────────────────────────────────────────────────────────────
-    data_dir: str = "pretrain_data"
+    # New directory so the smol baseline (pretrain_data/) remains reproducible.
+    data_dir: str = "pretrain_data_v2"
 
     # ── Model ────────────────────────────────────────────────────────────────
-    # 46.7M-param recipe. Roughly:
-    #   embed(vocab*d) + 12 * (4*d^2 attn + 3*d*d_ff ffn) + final norm
-    #   = 16k*512 + 12*(4*512^2 + 3*512*1408) ≈ 8M + 38.7M ≈ 46.7M
-    d_model: int = 512
-    n_heads: int = 8
+    # ~97M-param recipe. SwiGLU d_ff = ⌈8/3 · d_model⌉₆₄ = 2048 for d_model=768.
+    #   embed (tied with lm_head):  16000 · 768            ≈ 12.29M
+    #   per block: 4·768²  (attn QKVO)  +  3·768·2048  (SwiGLU)  ≈ 7.08M
+    #   12 blocks:                                              ≈ 84.95M
+    #   total                                                   ≈ 97.24M
+    # Head dim stays 64 (768 / 12) — same as the 46.7M baseline (512 / 8).
+    d_model: int = 768
+    n_heads: int = 12
     n_layers: int = 12
-    max_len: int = 512        # context length during training
+    max_len: int = 512        # context length during training (kept from v1)
     dropout: float = 0.0
     rope_base: float = 10000.0
     norm_eps: float = 1e-5
@@ -88,8 +116,8 @@ class TrainConfig:
     # ── Training ─────────────────────────────────────────────────────────────
     block_size: int = 512
     micro_batch_size: int = 4
-    grad_accum_steps: int = 16   # effective batch size = micro * accum = 64
-    total_steps: int = 20_000
+    grad_accum_steps: int = 16   # effective batch size = micro · accum = 64
+    total_steps: int = 60_000    # ~1.97B tokens, ~1 epoch over a 2B corpus
     eval_interval: int = 500
     eval_iters: int = 100        # number of val batches per eval
     log_interval: int = 20
@@ -97,9 +125,12 @@ class TrainConfig:
     sample_interval: int = 1000  # generate samples every N steps
 
     # ── Optimizer ────────────────────────────────────────────────────────────
+    # max_lr kept at 3e-4 — GPT-3-class LR for the ~100M band (Brown et al.
+    # 2020 use 6e-4 at 125M; conservative 3e-4 is well within stable range
+    # and matches what we used at 46.7M, simplifying comparison).
     max_lr: float = 3e-4
     min_lr: float = 3e-5
-    warmup_steps: int = 1000
+    warmup_steps: int = 2000     # scaled 2x with total_steps for stability
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
@@ -107,7 +138,7 @@ class TrainConfig:
 
     # ── Misc ─────────────────────────────────────────────────────────────────
     seed: int = 42
-    out_dir: str = "checkpoints_pretrain"
+    out_dir: str = "checkpoints_pretrain_v2"
     use_amp: bool = True
 
 

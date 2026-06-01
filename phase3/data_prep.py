@@ -1,37 +1,54 @@
 """
-saLLMan Phase 3a — Data preparation for pretraining.
+saLLMan Phase 3a (v2) — Pretraining data prep using full The Stack Python.
 
-Produces the four files in <out_dir>/ that pretrain.py expects:
-  - bpe_tokenizer.json   byte-level BPE, vocab=16000, specials at ids 0..3
-  - train.bin            uint16 tokens (concatenated docs, <eos> between docs)
-  - val.bin              same, ~0.5 % of documents
-  - meta.json            vocab_size, token counts, special token ids, sources
+What changed from the smol baseline
+-----------------------------------
+The previous version of this file pulled bigcode/the-stack-smol Python (10k
+files, ~24M tokens). At the 46.7M-param target this gave a token/parameter
+ratio of ~0.5, ~40x below Chinchilla's ~20 tokens/param lower bound
+(Hoffmann et al. 2022, https://arxiv.org/abs/2203.15556), and training ran
+for ~28 epochs of the same corpus. Result: train PPL=1.34 vs val PPL=68 at
+step 20k — textbook overfitting.
 
-Phase 3a covers ONE source: bigcode/the-stack-smol Python (10k files, ~24M tokens).
-Phase 3b will extend with CodeForces problems + submissions in a separate script.
+This v2 fixes the data side:
+  - Source: bigcode/the-stack-dedup (data/python/), streamed.
+  - Stop condition: configurable --target-tokens budget (default 2B,
+    Chinchilla-class for the ~97M model in pretrain.py).
+  - On-disk JSONL staging — corpus never has to fit in RAM.
+  - BPE trained on a bounded sample of documents so the tokenizers trainer
+    doesn't OOM on a multi-GB corpus.
 
-Lessons baked into this implementation (see Phase 3 handoff):
-  L1 — datasets >= 4.0 dropped script-based loaders. We bypass entirely by
-       downloading a single file with hf_hub_download and loading it as a
-       generic JSON dataset, never invoking the repo's loader script.
-  L4 — the-stack-smol's data_dir / data_files config keys are fragile. The
-       robust pattern is hf_hub_download → load_dataset("json", data_files=…).
-  L5 — schema verified live (2026-05-10): rows=10000, columns include
-       'content' (the code), 'repository_name', 'path', 'lang', 'licenses', …
-  L6 — the-stack-smol layout is data/{lang}/data.json (single JSON), NOT
-       data/{lang}/*.parquet shards. The handoff's parquet glob was wrong.
+The smol pipeline is preserved in git history; this file replaces it.
+
+Outputs (in <out_dir>/):
+  - bpe_tokenizer.json       byte-level BPE, vocab=16000, specials at ids 0..3
+  - train.bin                uint16 tokens, doc-separated by <eos>
+  - val.bin                  uint16 tokens, ~0.5% of docs
+  - meta.json                vocab_size, token counts, special ids, sources
+  - docs.jsonl               staging file (kept by default for resumability;
+                             pass --keep-staging=false to delete after run)
 
 References:
-  - Sennrich et al. 2016, "Neural Machine Translation of Rare Words with
-    Subword Units" (BPE) — https://arxiv.org/abs/1508.07909
-  - Radford et al. 2019, GPT-2 (byte-level BPE) — https://cdn.openai.com/
-    better-language-models/language_models_are_unsupervised_multitask_learners.pdf
-  - Karpathy nanoGPT (memory-mapped uint16 token arrays) —
-    https://github.com/karpathy/nanoGPT/blob/master/data/openwebtext/prepare.py
+  - Hoffmann et al. 2022, "Training Compute-Optimal LLMs" (Chinchilla)
+    https://arxiv.org/abs/2203.15556
+  - Kocetkov et al. 2022, "The Stack: 3 TB of permissively licensed code"
+    https://arxiv.org/abs/2211.15533
+  - Sennrich et al. 2016, BPE — https://arxiv.org/abs/1508.07909
+  - Radford et al. 2019, GPT-2 byte-level BPE
+  - Karpathy nanoGPT — memory-mapped uint16 token arrays
 
-Usage:
-    python data_prep.py [--out pretrain_data] [--vocab-size 16000]
-                        [--val-ratio 0.005] [--seed 42]
+Auth
+----
+bigcode/the-stack-dedup is gated. You must:
+  1. Accept the dataset terms at
+     https://huggingface.co/datasets/bigcode/the-stack-dedup
+  2. Have HF_TOKEN in .env (already required by the smol pipeline).
+
+Usage
+-----
+    python data_prep.py                           # 2B-token default
+    python data_prep.py --target-tokens 500_000_000   # smaller for a smoke test
+    python data_prep.py --out pretrain_data_v2 --vocab-size 16000
 """
 from __future__ import annotations
 
@@ -43,8 +60,8 @@ from pathlib import Path
 from typing import Iterator
 
 import numpy as np
-from datasets import Dataset, load_dataset
-from huggingface_hub import hf_hub_download
+from datasets import load_dataset
+from dotenv import load_dotenv
 from tokenizers import Tokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
@@ -54,75 +71,163 @@ from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
-# Special tokens — order = ids 0..3.  pretrain.py depends on these IDs.
+# Special tokens — order = ids 0..3. pretrain.py depends on these IDs.
 # ---------------------------------------------------------------------------
 SPECIAL_TOKENS: list[str] = ["<pad>", "<bos>", "<eos>", "<unk>"]
 PAD_IDX, BOS_IDX, EOS_IDX, UNK_IDX = 0, 1, 2, 3
 
-# Source identifier (also written into meta.json)
-SOURCE_NAME: str = "bigcode/the-stack-smol:python"
-HF_REPO: str = "bigcode/the-stack-smol"
-HF_FILE: str = "data/python/data.json"
+# Source identifier (also written into meta.json).
+# the-stack-dedup is deduplicated near-exact (file-level MinHash); preferred
+# over the-stack for training corpora since duplicates inflate epoch counts
+# silently and hurt generalisation.
+SOURCE_NAME: str = "bigcode/the-stack-dedup:python"
+HF_REPO: str = "bigcode/the-stack-dedup"
+HF_DATA_DIR: str = "data/python"
+
+# Document filters (empirically chosen)
+MIN_CHARS: int = 64           # drop near-empty stubs
+MAX_CHARS: int = 100_000      # drop pathological mega-files (notebooks, generated)
+
+# Rough chars/token ratio for Python BPE@16k. Used only to estimate when to
+# stop streaming — we verify the true token count after tokenisation.
+APPROX_CHARS_PER_TOKEN: float = 3.8
+
+# Cap for BPE training corpus. BpeTrainer holds its input in memory.
+BPE_TRAIN_MAX_DOCS: int = 200_000
 
 
 # ---------------------------------------------------------------------------
-# 1. Load source data
+# 1. Stream the source and stage to disk
 # ---------------------------------------------------------------------------
-def load_stack_smol_python() -> Dataset:
+def stage_corpus(
+    staging_path: Path,
+    target_tokens: int,
+) -> tuple[int, int]:
     """
-    Download data/python/data.json from bigcode/the-stack-smol and load it
-    as a HF Dataset.
+    Stream bigcode/the-stack-dedup data/python until we've accumulated roughly
+    `target_tokens` worth of text (using a char/token estimate), writing each
+    doc as a JSONL line {"content": "..."} to `staging_path`.
 
-    The hf_hub_download → load_dataset("json", ...) pattern bypasses both
-    the deprecated script loader (L1) and the data_dir/data_files config
-    indirection that broke in earlier iterations (L4).
+    Why streaming + JSONL staging
+    -----------------------------
+    Pulling the full Python subset to local parquet would cost hundreds of GB
+    and most of it we wouldn't use. Streaming pages files on demand from HF
+    and we stop as soon as the budget is met. JSONL on disk lets every later
+    pass (BPE training, tokenisation, val split) iterate without re-streaming.
+
+    Resumable
+    ---------
+    If `staging_path` already exists, we trust it and skip the download.
+    Delete the file to force a re-pull.
+
+    Returns (n_docs_written, total_chars_written).
     """
-    print(f"[1/5] Downloading {HF_REPO}:{HF_FILE} ...")
-    local_path = hf_hub_download(HF_REPO, filename=HF_FILE, repo_type="dataset")
-    print(f"      cached at: {local_path}")
-    print(f"      size: {os.path.getsize(local_path) / 1e6:.1f} MB")
+    if staging_path.exists():
+        # Trust the cache. Count what's there so the next stages know the size.
+        print(f"[1/5] Staging file already exists at {staging_path} — reusing.")
+        n_docs, n_chars = 0, 0
+        with staging_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                n_docs += 1
+                # Avoid full JSON parse just to count chars — we serialized
+                # exactly one key, so len(content)+overhead is approximately
+                # len(line). But for an exact count, parse.
+                try:
+                    n_chars += len(json.loads(line)["content"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        print(f"      cached: {n_docs:,} docs, {n_chars/1e9:.2f}B chars")
+        return n_docs, n_chars
 
-    ds = load_dataset("json", data_files=local_path, split="train")
+    target_chars = int(target_tokens * APPROX_CHARS_PER_TOKEN)
+    print(f"[1/5] Streaming {HF_REPO}:{HF_DATA_DIR}")
+    print(f"      target: {target_tokens/1e9:.2f}B tokens "
+          f"(~{target_chars/1e9:.2f}B chars at {APPROX_CHARS_PER_TOKEN:.1f} char/tok)")
 
-    # Defensive schema check (L5). If 'content' disappears we want a clear
-    # error pointing at the actual columns, not 0 silent results downstream.
-    if "content" not in ds.column_names:
-        sample_keys = list(ds[0].keys()) if len(ds) > 0 else []
-        raise RuntimeError(
-            f"Expected 'content' column in {SOURCE_NAME}; got columns "
-            f"{ds.column_names}. First-row keys: {sample_keys}. "
-            "If the dataset schema changed, update HF_FILE or the column name."
-        )
+    load_dotenv()  # picks up HF_TOKEN from .env if present
+    token = os.environ.get("HF_TOKEN")
 
-    print(f"      rows: {len(ds):,}")
-    print(f"      columns: {ds.column_names}")
-    return ds
-
-
-# ---------------------------------------------------------------------------
-# 2. Train byte-level BPE
-# ---------------------------------------------------------------------------
-def train_bpe(docs: list[str], vocab_size: int) -> Tokenizer:
-    """
-    Byte-level BPE following GPT-2 / LLaMA conventions.
-
-    Why byte-level
-    --------------
-    Code contains arbitrary Unicode (string literals, comments) and unusual
-    whitespace. Byte-level BPE has a closed alphabet of 256 bytes and never
-    produces <unk>, which matters for code where any character is potentially
-    semantically meaningful.
-
-    Why add_prefix_space=False
-    --------------------------
-    GPT-2 uses add_prefix_space=True so 'Hello' and ' Hello' are merged into
-    one token type. For code, leading whitespace is structurally meaningful
-    (Python indentation!) so we keep prefixes literal.
-    """
-    print(
-        f"[2/5] Training byte-level BPE (vocab_size={vocab_size}) on "
-        f"{len(docs):,} docs ..."
+    # streaming=True returns an IterableDataset — yields rows without
+    # materialising the corpus locally.
+    ds = load_dataset(
+        HF_REPO,
+        data_dir=HF_DATA_DIR,
+        split="train",
+        streaming=True,
+        token=token,
     )
+
+    n_docs = 0
+    n_chars = 0
+    n_skipped_short = 0
+    n_skipped_long = 0
+
+    # tqdm with a chars-based total so the bar reflects budget progress.
+    pbar = tqdm(total=target_chars, unit="char", unit_scale=True, desc="staging")
+
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    with staging_path.open("w", encoding="utf-8") as f:
+        for row in ds:
+            content = row.get("content")
+            if content is None:
+                continue
+            L = len(content)
+            if L < MIN_CHARS:
+                n_skipped_short += 1
+                continue
+            if L > MAX_CHARS:
+                n_skipped_long += 1
+                continue
+
+            # Write a minimal JSON object — content only — to keep the file
+            # small and the parser simple downstream.
+            f.write(json.dumps({"content": content}, ensure_ascii=False) + "\n")
+            n_docs += 1
+            n_chars += L
+            pbar.update(L)
+
+            if n_chars >= target_chars:
+                break
+
+    pbar.close()
+
+    print(f"      wrote {n_docs:,} docs, {n_chars/1e9:.2f}B chars to {staging_path}")
+    print(f"      skipped (too short <{MIN_CHARS}): {n_skipped_short:,}")
+    print(f"      skipped (too long >{MAX_CHARS}): {n_skipped_long:,}")
+    return n_docs, n_chars
+
+
+# ---------------------------------------------------------------------------
+# 2. Train byte-level BPE on a sampled subset
+# ---------------------------------------------------------------------------
+def _iter_jsonl_content(path: Path, limit: int | None = None) -> Iterator[str]:
+    """Yield 'content' field from each JSONL line, optionally up to `limit`."""
+    n = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                yield json.loads(line)["content"]
+            except (json.JSONDecodeError, KeyError):
+                continue
+            n += 1
+            if limit is not None and n >= limit:
+                return
+
+
+def train_bpe(staging_path: Path, vocab_size: int, n_total_docs: int) -> Tokenizer:
+    """
+    Train byte-level BPE on at most BPE_TRAIN_MAX_DOCS sampled from the
+    staged corpus. With 2B-token corpora the BPE trainer would otherwise
+    keep gigabytes of strings live; ~200k Python files (~600 MB of code)
+    is plenty for a converged 16k vocabulary.
+
+    Why byte-level + add_prefix_space=False: same as the smol pipeline —
+    code has structural whitespace (indentation) we want to keep literal,
+    and byte-level means no <unk> ever fires for arbitrary Unicode.
+    """
+    n_train = min(BPE_TRAIN_MAX_DOCS, n_total_docs)
+    print(f"[2/5] Training byte-level BPE (vocab_size={vocab_size}) on "
+          f"{n_train:,} sampled docs ...")
 
     tokenizer = Tokenizer(BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
@@ -130,18 +235,19 @@ def train_bpe(docs: list[str], vocab_size: int) -> Tokenizer:
 
     trainer = BpeTrainer(
         vocab_size=vocab_size,
-        special_tokens=SPECIAL_TOKENS,            # order is preserved → ids 0..3
-        initial_alphabet=ByteLevel.alphabet(),    # seed all 256 byte chars
+        special_tokens=SPECIAL_TOKENS,         # order preserved → ids 0..3
+        initial_alphabet=ByteLevel.alphabet(), # seed all 256 byte chars
         show_progress=True,
     )
 
-    def iter_docs() -> Iterator[str]:
-        for d in docs:
-            yield d
+    tokenizer.train_from_iterator(
+        _iter_jsonl_content(staging_path, limit=n_train),
+        trainer=trainer,
+        length=n_train,
+    )
 
-    tokenizer.train_from_iterator(iter_docs(), trainer=trainer, length=len(docs))
-
-    # Verify special-token ids are exactly 0..3 (pretrain.py depends on this).
+    # Verify special-token ids are 0..3 — pretrain.py and the EOS doc
+    # separator below depend on this.
     for name, expected in zip(SPECIAL_TOKENS, range(len(SPECIAL_TOKENS))):
         got = tokenizer.token_to_id(name)
         if got != expected:
@@ -150,29 +256,37 @@ def train_bpe(docs: list[str], vocab_size: int) -> Tokenizer:
                 "BpeTrainer special-token ordering may have changed."
             )
     print(f"      vocab size: {tokenizer.get_vocab_size():,}")
-    print(
-        f"      special token ids verified: "
-        f"{[(t, tokenizer.token_to_id(t)) for t in SPECIAL_TOKENS]}"
-    )
+    print(f"      special token ids: "
+          f"{[(t, tokenizer.token_to_id(t)) for t in SPECIAL_TOKENS]}")
     return tokenizer
 
 
 # ---------------------------------------------------------------------------
-# 3. Tokenize and pack into a uint16 array
+# 3. Tokenise the staged corpus and write train/val bins incrementally
 # ---------------------------------------------------------------------------
-def tokenize_split(
+def tokenise_and_pack(
     tokenizer: Tokenizer,
-    docs: list[str],
-    desc: str,
-) -> np.ndarray:
+    staging_path: Path,
+    train_bin: Path,
+    val_bin: Path,
+    n_total_docs: int,
+    val_ratio: float,
+    seed: int,
+    encode_chunk: int = 1024,
+) -> tuple[int, int]:
     """
-    Encode each document, append <eos>, and concatenate into a 1-D uint16
-    array. Returns shape (n_total_tokens,).
+    Stream the staged corpus, encode in chunks of `encode_chunk` docs, and
+    append to train.bin or val.bin as uint16 raw bytes. Per-doc split is
+    decided up-front by hash-shuffling indices so it's deterministic given
+    the seed.
 
-    Document boundaries: <eos> after each doc; no <bos> between docs (BOS is
-    only used at the start of a generation prompt, per the handoff).
+    Why incremental writes
+    ----------------------
+    At 2B tokens, train.bin is ~4 GB. Building it in memory first wastes
+    RAM and would race with the BPE training stage. Writing as we go means
+    peak memory is bounded by one chunk's worth of encoded tokens (~10MB).
 
-    uint16 is safe iff vocab_size <= 65535 — asserted below.
+    Returns (n_train_tokens, n_val_tokens).
     """
     if tokenizer.get_vocab_size() > np.iinfo(np.uint16).max:
         raise ValueError(
@@ -181,43 +295,76 @@ def tokenize_split(
             "in pretrain.py's np.memmap call."
         )
 
-    # encode_batch is the fast Rust path. We chunk it to bound peak memory
-    # and to get a meaningful progress bar.
-    chunk_size = 1024
-    pieces: list[np.ndarray] = []
-    n_tokens = 0
+    # Decide train/val membership for every doc up-front.
+    rng = random.Random(seed)
+    indices = list(range(n_total_docs))
+    rng.shuffle(indices)
+    n_val = max(1, int(n_total_docs * val_ratio))
+    val_set = set(indices[:n_val])
 
-    for i in tqdm(range(0, len(docs), chunk_size), desc=desc):
-        batch = docs[i : i + chunk_size]
-        encs = tokenizer.encode_batch(batch)
-        for enc in encs:
-            ids = enc.ids
-            ids.append(EOS_IDX)                                 # doc separator
-            arr = np.asarray(ids, dtype=np.uint16)
-            pieces.append(arr)
-            n_tokens += len(arr)
+    print(f"[3/5] Tokenising + writing bins")
+    print(f"      train docs: {n_total_docs - n_val:,}")
+    print(f"      val docs:   {n_val:,}  (val_ratio={val_ratio})")
 
-    out = np.concatenate(pieces, dtype=np.uint16)
-    assert out.shape == (n_tokens,)
-    return out
+    train_bin.parent.mkdir(parents=True, exist_ok=True)
+    n_train_tokens = 0
+    n_val_tokens = 0
+
+    # Open both bins in binary-append mode (truncate first to be safe).
+    with train_bin.open("wb") as ft, val_bin.open("wb") as fv:
+        batch: list[str] = []
+        batch_idx: list[int] = []
+        doc_idx = 0
+
+        def flush(batch: list[str], batch_idx: list[int]) -> tuple[int, int]:
+            """Encode the batch, append <eos>, route each doc to train/val."""
+            nonlocal n_train_tokens, n_val_tokens
+            if not batch:
+                return 0, 0
+            encs = tokenizer.encode_batch(batch)
+            added_train = 0
+            added_val = 0
+            for enc, idx in zip(encs, batch_idx):
+                ids = enc.ids
+                ids.append(EOS_IDX)
+                arr = np.asarray(ids, dtype=np.uint16)
+                if idx in val_set:
+                    arr.tofile(fv)
+                    n_val_tokens += arr.size
+                    added_val += arr.size
+                else:
+                    arr.tofile(ft)
+                    n_train_tokens += arr.size
+                    added_train += arr.size
+            return added_train, added_val
+
+        pbar = tqdm(total=n_total_docs, desc="tokenising")
+        for content in _iter_jsonl_content(staging_path):
+            batch.append(content)
+            batch_idx.append(doc_idx)
+            doc_idx += 1
+            if len(batch) >= encode_chunk:
+                flush(batch, batch_idx)
+                batch.clear()
+                batch_idx.clear()
+                pbar.update(encode_chunk)
+        # Final partial chunk
+        if batch:
+            flush(batch, batch_idx)
+            pbar.update(len(batch))
+        pbar.close()
+
+    print(f"      train tokens: {n_train_tokens:,}")
+    print(f"      val tokens:   {n_val_tokens:,}")
+    print(f"      train.bin: {train_bin.stat().st_size/1e9:.2f} GB")
+    print(f"      val.bin:   {val_bin.stat().st_size/1e6:.1f} MB")
+    return n_train_tokens, n_val_tokens
 
 
 # ---------------------------------------------------------------------------
-# 4. Output writers
+# 4. meta.json — schema must match what pretrain.py reads
 # ---------------------------------------------------------------------------
-def write_bin(arr: np.ndarray, path: Path) -> None:
-    """Write a 1-D uint16 array as raw bytes (memory-mappable, no header)."""
-    assert arr.dtype == np.uint16, f"expected uint16, got {arr.dtype}"
-    arr.tofile(path)
-
-
-def write_meta(
-    out_dir: Path,
-    vocab_size: int,
-    n_train: int,
-    n_val: int,
-) -> None:
-    """Schema must match what pretrain.py reads — see handoff doc."""
+def write_meta(out_dir: Path, vocab_size: int, n_train: int, n_val: int) -> None:
     meta = {
         "vocab_size":     vocab_size,
         "n_train_tokens": n_train,
@@ -232,15 +379,14 @@ def write_meta(
 
 
 # ---------------------------------------------------------------------------
-# 5. Verify outputs (handoff requirement #3)
+# 5. Verify outputs
 # ---------------------------------------------------------------------------
 def verify_outputs(out_dir: Path, tokenizer: Tokenizer, n_preview: int = 100) -> None:
-    """Memory-map train.bin and decode the first N tokens for a sanity check."""
     arr = np.memmap(out_dir / "train.bin", dtype=np.uint16, mode="r")
     print(f"\n[5/5] Verifying train.bin: {len(arr):,} tokens (memory-mapped)")
     head = arr[:n_preview].tolist()
     print(f"      first {n_preview} ids head/tail: {head[:10]} ... {head[-5:]}")
-    print(f"      decoded preview:")
+    print("      decoded preview:")
     print("      " + "-" * 60)
     decoded = tokenizer.decode(head)
     for line in decoded.split("\n"):
@@ -253,76 +399,78 @@ def verify_outputs(out_dir: Path, tokenizer: Tokenizer, n_preview: int = 100) ->
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 3a data prep: the-stack-smol Python → train.bin/val.bin."
+        description="Phase 3a (v2) data prep: The Stack Python → train.bin/val.bin."
     )
-    parser.add_argument("--out", type=Path, default=Path("pretrain_data"))
+    parser.add_argument("--out", type=Path, default=Path("pretrain_data_v2"))
+    parser.add_argument(
+        "--target-tokens", type=int, default=2_000_000_000,
+        help="Approximate training token budget (default 2B, Chinchilla-class "
+             "for ~97M-param target).",
+    )
     parser.add_argument("--vocab-size", type=int, default=16000)
     parser.add_argument(
         "--val-ratio", type=float, default=0.005,
-        help="Fraction of documents held out for validation (default 0.5%%)",
+        help="Fraction of documents held out for validation (default 0.5%%).",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--keep-staging", action="store_true", default=True,
+        help="Keep docs.jsonl after run (default; allows re-tokenisation "
+             "without re-streaming). Pass --no-keep-staging to delete.",
+    )
+    parser.add_argument("--no-keep-staging", dest="keep_staging",
+                        action="store_false")
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {args.out.resolve()}\n")
 
-    # ── 1. Load ───────────────────────────────────────────────────────────────
-    ds = load_stack_smol_python()
-    docs: list[str] = list(ds["content"])
+    staging_path = args.out / "docs.jsonl"
 
-    # ── 2. Document-level train/val split ─────────────────────────────────────
-    # Splitting at document granularity (not token granularity) avoids leaking
-    # the start of a held-out doc into the train tail, which would make val
-    # loss artificially low.
-    rng = random.Random(args.seed)
-    indices = list(range(len(docs)))
-    rng.shuffle(indices)
-    n_val = max(1, int(len(docs) * args.val_ratio))
-    val_idx = set(indices[:n_val])
-    train_docs = [docs[i] for i in range(len(docs)) if i not in val_idx]
-    val_docs   = [docs[i] for i in range(len(docs)) if i in val_idx]
-    print(
-        f"      split: {len(train_docs):,} train docs / "
-        f"{len(val_docs):,} val docs  (seed={args.seed})"
-    )
+    # 1. Stream + stage
+    n_docs, _ = stage_corpus(staging_path, args.target_tokens)
+    if n_docs == 0:
+        raise RuntimeError(
+            "No documents staged. Check HF_TOKEN access to "
+            f"{HF_REPO} (accept terms on the dataset page)."
+        )
 
-    # ── 3. Train BPE on TRAIN docs only ──────────────────────────────────────
-    # Training the tokenizer on val docs would technically leak val statistics
-    # into the model's vocabulary. The cost of excluding 50 docs is negligible.
-    tokenizer = train_bpe(train_docs, vocab_size=args.vocab_size)
+    # 2. Train BPE
+    tokenizer = train_bpe(staging_path, vocab_size=args.vocab_size,
+                          n_total_docs=n_docs)
     tokenizer.save(str(args.out / "bpe_tokenizer.json"))
     print(f"      saved tokenizer to {args.out / 'bpe_tokenizer.json'}")
 
-    # ── 4. Tokenize and write bins ────────────────────────────────────────────
-    print("[3/5] Tokenizing splits ...")
-    train_arr = tokenize_split(tokenizer, train_docs, desc="train")
-    val_arr   = tokenize_split(tokenizer, val_docs,   desc="val  ")
-    print(f"      train tokens: {len(train_arr):,}")
-    print(f"      val tokens:   {len(val_arr):,}")
-    print(
-        f"      train/val ratio: {len(train_arr)/(len(val_arr) or 1):.1f}x  "
-        f"(target: ~{1/args.val_ratio:.0f}x)"
+    # 3. Tokenise + pack
+    n_train, n_val = tokenise_and_pack(
+        tokenizer,
+        staging_path=staging_path,
+        train_bin=args.out / "train.bin",
+        val_bin=args.out / "val.bin",
+        n_total_docs=n_docs,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
     )
 
-    print("[4/5] Writing bins + meta.json ...")
-    write_bin(train_arr, args.out / "train.bin")
-    write_bin(val_arr,   args.out / "val.bin")
+    # 4. meta.json
+    print("[4/5] Writing meta.json ...")
     write_meta(
         args.out,
         vocab_size=tokenizer.get_vocab_size(),
-        n_train=len(train_arr),
-        n_val=len(val_arr),
+        n_train=n_train,
+        n_val=n_val,
     )
-    print(f"      train.bin: {(args.out / 'train.bin').stat().st_size / 1e6:.1f} MB")
-    print(f"      val.bin:   {(args.out / 'val.bin').stat().st_size / 1e6:.1f} MB")
     print(f"      meta.json written")
 
-    # ── 5. Verify ─────────────────────────────────────────────────────────────
+    # 5. Verify
     verify_outputs(args.out, tokenizer)
 
+    if not args.keep_staging:
+        staging_path.unlink(missing_ok=True)
+        print(f"\nDeleted staging file {staging_path}")
+
     print("\nDone. Next step:")
-    print("    python pretrain.py")
+    print(f"    python pretrain.py            # uses {args.out}/ by default")
 
 
 if __name__ == "__main__":
