@@ -38,6 +38,7 @@ satisfied for the first time.
 
 ## Files
 
+### Pretraining
 | File | Role |
 |------|------|
 | [decoder_only_v3.py](decoder_only_v3.py) | GPTConfigV3 + GPTv3. Inherits Phase 2 block; adds gradient-checkpointing wrapper around the forward pass. |
@@ -47,6 +48,14 @@ satisfied for the first time.
 | `pretrain_data_v2/` | v2 data outputs (created by current `data_prep.py`). |
 | `checkpoints_pretrain/` (legacy) | v1 model checkpoints (final val_loss 4.16). |
 | `checkpoints_pretrain_v2/` | v2 model checkpoints. |
+
+### Fine-tuning (SFT)
+| File | Role |
+|------|------|
+| [finetune_data_prep.py](finetune_data_prep.py) | Build the SFT corpus from `open-r1/codeforces` + `greengerong/leetcode`; emit `train.jsonl` / `val.jsonl` with input_ids + loss_mask. |
+| [finetune.py](finetune.py) | Load the pretrained checkpoint, run masked-loss SFT with dynamic-padded batches, save best/last. |
+| `finetune_data_v2/` | SFT data outputs (created by `finetune_data_prep.py`). |
+| `checkpoints_finetune_v2/` | SFT model checkpoints. |
 
 ---
 
@@ -396,18 +405,232 @@ for it. Either grow `--target-tokens` in data_prep or shrink `d_model`.
 
 ---
 
-## What comes next (Phase 3 fine-tuning + Phase 4)
+---
 
-The original project plan calls for, after pretraining:
+## Supervised fine-tuning (SFT)
 
-- **Phase 3 fine-tuning** — supervised fine-tune on chain-of-thought
-  reasoning traces (problem → reasoning steps → code). Sources:
-  `greengerong/leetcode`, `evanelias/usaco`, `open-r1/codeforces`.
-  Where CoT traces are missing, distill from GPT-4o.
+The pretrained checkpoint speaks Python but not "given a problem, produce
+reasoning + code". SFT teaches that distribution. Two new files:
+
+### [finetune_data_prep.py](finetune_data_prep.py)
+
+Builds an instruction-tuning corpus from datasets that **already** contain
+chain-of-thought reasoning traces (no GPT-4o distillation needed for the
+first pass):
+
+- `open-r1/codeforces` — Codeforces problems with DeepSeek-R1 reasoning.
+- `greengerong/leetcode` — LeetCode problems. Used only for entries
+  where a reasoning/editorial-style section is detectable; otherwise
+  skipped (per the "only datasets with reasoning" preference).
+
+**Output format**: each example is JSONL,
+`{"input_ids": [int, ...], "loss_mask": [0/1, ...]}`. The `loss_mask` is
+0 on prompt tokens and 1 on response tokens. At training time, label
+positions with `loss_mask=0` are replaced with `-100` so
+`F.cross_entropy(ignore_index=-100)` skips them — i.e., the model is
+graded only on what it had to *generate*, not on copying the problem.
+
+**Prompt/response shape** (tagged sections — no new special tokens needed):
+```
+<problem>
+{problem text}
+</problem>
+<reasoning>          ← prompt ends here, response begins
+{chain-of-thought}
+</reasoning>
+<code>
+{solution}
+</code><eos>
+```
+Putting the opening `<reasoning>` tag in the **prompt** means at inference
+time you build the same prefix and the model picks up from there. Loss
+gradient flows through everything after that tag, including the closing
+`</reasoning>` and the `<code>...</code><eos>` block — that's how it
+learns to emit the boundary markers and stop cleanly.
+
+**Source-schema handling**: each dataset's schema is probed at load time
+(`extract_open_r1_codeforces`, `extract_greengerong_leetcode`). Multiple
+common column names are tried, with clear errors when none match. The
+LeetCode loader uses a heuristic split on the first fenced code block
+to separate prose-reasoning from code; if a row has no detectable prose
+it's dropped (when `--require-reasoning` is on, which is the default).
+
+**Why tokenize prompt and response separately**: building the loss mask
+by hand is much safer than searching for a delimiter token afterward.
+BPE may merge `<reasoning>` differently than `</reasoning>` depending on
+neighboring whitespace; separate encodes guarantee bit-exact boundary
+alignment.
+
+**Length filtering**: examples whose total token count exceeds
+`--max-len` (default 512, the pretrained model's context) are dropped
+rather than truncated — a truncated CoT trace is worse than no trace.
+A length histogram (`min, p50, p95, max`) is printed for visibility.
+
+**Run**:
+```bash
+cd phase3
+python finetune_data_prep.py                       # → finetune_data_v2/
+python finetune_data_prep.py --no-require-reasoning   # relax filter
+python finetune_data_prep.py --max-len 1024 \\
+                              --out finetune_data_v2_long
+```
+
+### [finetune.py](finetune.py) — section-by-section
+
+Loop structure mirrors `pretrain.py` but with three substantive changes:
+**masked loss**, **dynamic-padded batches**, and a **fresh optimiser**
+(we don't resume pretrain's Adam state).
+
+#### §1 `FTConfig`
+SFT-appropriate defaults:
+- `max_lr=2e-5, min_lr=2e-6` — one-to-two orders below pretrain. Why:
+  pretrained weights are already in a good basin; SFT adapts them rather
+  than searching anew. Standard practice across LLaMA, Mistral, Qwen
+  fine-tunes.
+- `warmup_ratio=0.03` — 3% of total steps. Pre-LN models don't need
+  much warmup; this is just to soften the initial step.
+- `epochs=3, micro_batch=8, grad_accum=4` → effective batch 32. Small
+  enough to step often on a few-thousand-example corpus.
+- `weight_decay=0.1` with the same selective recipe as pretrain (norms,
+  biases, embeddings exempt).
+
+#### §2 `FinetuneDataset` + `make_collate`
+`FinetuneDataset` loads `train.jsonl`/`val.jsonl` into RAM at startup —
+SFT corpora are small (~10s of MB after tokenization), no point memmapping.
+
+`make_collate(pad_idx)` returns the collate function that:
+1. Pads `input_ids` to the longest in the batch with `pad_idx=0`.
+2. Builds the **labels tensor** by shifting `input_ids` by 1 and gating
+   on `loss_mask`. Positions where the shifted-mask is 0 → `-100`.
+   Pad positions → `-100`.
+3. Builds `attn_keep` (1 = real token, 0 = pad). Currently not consumed
+   by the model — the causal mask plus `ignore_index=-100` is sufficient
+   — but kept for future use (e.g. truncating during KV-cached inference).
+
+**The shift-by-1 detail**: at training position `t`, the model sees
+`input_ids[t]` and must predict `input_ids[t+1]`. So `labels[t] = input_ids[t+1]`
+*if* `loss_mask[t+1] == 1`, else `IGNORE`. The very last position has no
+next-token, so its label stays `IGNORE`.
+
+#### §3 `masked_lm_loss`
+Plain `F.cross_entropy` with `ignore_index=-100`. Mean is over non-ignored
+positions only — each response token contributes equally regardless of
+the prompt length preceding it.
+
+#### §4 `get_lr(step, ...)`
+Same cosine-with-warmup function as pretrain, parameterised by
+`total_steps` and `warmup_steps`. Both are computed from the dataset
+size and `cfg.epochs` — no pre-fixed step budget.
+
+#### §5 `make_optimizer`
+Identical to pretrain (LLaMA selective weight decay, fused AdamW on CUDA).
+
+#### §6 `load_pretrained(ckpt_path, ...)`
+Three steps:
+1. Load the pretrain checkpoint (`weights_only=False` — payload contains
+   dicts and dataclasses).
+2. Reconstruct `GPTConfigV3` from the saved `model_cfg` dict, allowing
+   CLI override of `gradient_checkpointing`.
+3. Build a fresh `GPTv3`, load `model_state`. **Do not** load
+   `optim_state` — fine-tune starts a new cosine schedule.
+
+Sanity check after load: assert `model_cfg.vocab_size == meta["vocab_size"]`.
+If they differ, the pretrain tokenizer and FT data tokenizer aren't the
+same file → silent garbage.
+
+#### §7 `evaluate`
+Standard token-weighted average loss over the val loader. Properly
+accounts for variable-length batches by multiplying loss by token count
+each batch and dividing by total tokens at the end (instead of plain
+mean-over-batches, which would over-weight short batches).
+
+#### §8 `generate_sample`
+Builds the same `<problem>...</problem>\n<reasoning>\n` prefix used during
+training and calls `model.generate(...)`. Logged every `sample_interval`
+steps so quality is visible without re-running an eval pass.
+
+`temperature=0.7, top_k=40` — modest randomness, prevents the visual
+sample from being purely greedy / repetitive.
+
+#### §9 Training loop
+Standard `for epoch in epochs: for batch in train_loader:` with manual
+gradient accumulation: collect `grad_accum_steps` micro-batches in a
+buffer, run forward+backward on each, then a single `optimizer.step()`.
+
+Subtle bit at epoch end: if the loader ran out before filling the accum
+buffer, we **still flush** the remaining micro-batches as one final
+optimiser step, with the loss scale adjusted to `1/len(buffer)` instead
+of `1/grad_accum_steps`. Otherwise the last few micro-batches per epoch
+would silently never reach the optimiser.
+
+**Resume semantics** (`--resume`):
+- Resume from `<out_dir>/last.pt`, NOT from the pretrain checkpoint.
+- Restores model state, optimizer state, step count, epoch, best val,
+  torch RNG. The dataloader doesn't have a position concept (we shuffle
+  each epoch), so we don't try to resume mid-epoch — we restart the
+  current epoch from the top.
+
+#### §10 CLI
+- `--data DIR` — override `finetune_data_v2/`.
+- `--pretrain PATH` — point at a different pretrain checkpoint.
+- `--out DIR` — override `checkpoints_finetune_v2/`.
+- `--epochs N`, `--micro_batch N`, `--grad_accum N`, `--lr F` — quick
+  knob tweaks.
+- `--gradient_checkpointing` — enable if SFT OOMs (shouldn't at micro_batch=8
+  + max_len=512 + 97M params, but headroom is good).
+- `--resume` — restart from FT `last.pt`.
+
+### Running the SFT pipeline
+
+```bash
+# 1. Wait for pretrain to finish (or use an intermediate checkpoint).
+# 2. Build the FT corpus (~minutes, no GPU needed):
+cd phase3
+python finetune_data_prep.py
+
+# 3. Fine-tune (~minutes-to-hours depending on dataset size):
+python finetune.py
+python finetune.py --resume
+python finetune.py --epochs 5 --lr 1e-5            # gentler schedule
+python finetune.py --pretrain checkpoints_pretrain_v2/last.pt    # use last instead of best
+```
+
+Checkpoints → `checkpoints_finetune_v2/last.pt` and `best.pt`. Training
+log → `checkpoints_finetune_v2/log.jsonl` (same JSONL format as pretrain).
+
+### Diagnostics for a healthy SFT
+
+- Initial val loss should sit somewhere in the 1.5–3.0 range (pretrain
+  loss was ~1.6 on raw code; SFT data has tagged structure the model
+  hasn't seen, so first-step loss is higher).
+- Val loss should fall **sharply** in the first ~200 steps (model adapts
+  to the tag scaffolding), then more gradually as it learns CoT
+  patterns.
+- Watch the generated samples after step ~400: should produce
+  reasoning-like prose followed by code-shaped output even if the code
+  doesn't yet solve the problem. If you see only repeated tokens or pure
+  prose, the masking is probably wrong (e.g., `loss_mask` was inverted).
+
+### Known gotchas
+
+- **Tokenizer drift**: `finetune.py` reads `tokenizer_path` from
+  `finetune_data_v2/meta.json`, which is the **absolute path written
+  at data prep time**. If you move directories, edit meta.json or pass
+  `--data` to point at a freshly re-prepped corpus.
+- **Loss mask shift**: the boundary is on the *shifted* mask, not the
+  raw mask. The label at position `t` corresponds to predicting
+  `input_ids[t+1]`, so the gating is `loss_mask[t+1]`. Easy to off-by-one
+  if you're modifying the collate.
+
+---
+
+## What comes next (Phase 4 + Phase 5)
+
 - **Phase 4 — GRPO RL** — generate N solution attempts per problem,
   execute against test cases, use pass/fail as reward (DeepSeek-R1 recipe).
+  Builds on top of the SFT checkpoint.
 - **Phase 5 — Evaluation** — pass@1 / pass@k on held-out LeetCode and
   HumanEval (Chen et al. 2021).
 
-None of these need architecture changes — they layer on top of the
-pretrained checkpoint.
+Neither requires architecture changes — both layer on top of the SFT
+checkpoint.
