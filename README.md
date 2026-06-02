@@ -65,9 +65,13 @@ saLLMan/
 | **Loss**         | Label smoothing   | Label smoothing       | Label smoothing           | Cross-entropy            |
 | **Precision**    | fp32              | bf16 autocast         | bf16 autocast             | bf16 autocast            |
 | **Generation**   | greedy (no cache) | greedy (no cache)     | KV-cache                  | KV-cache                 |
-| **Memory tricks** | —                | —                     | —                         | Grad checkpointing (opt) |
+| **Context**      | 200               | 256                   | 256                       | **2048**                 |
+| **Memory tricks** | —                | —                     | —                         | Grad checkpointing (on, required at 2048) |
 | **Data loading** | DataLoader        | DataLoader            | DataLoader                | `np.memmap` + random window |
 | **Params**       | ~8M               | ~6.8M                 | ~6.8M                     | ~97M                     |
+
+For a side-by-side comparison of the Phase 3 pretrain and fine-tune
+recipes, see [Appendix B](#appendix-b--pretrain-vs-fine-tune-recipe-comparison).
 
 ### Phase 0 — Vanilla Transformer
 
@@ -111,44 +115,94 @@ architectural gain.
 
 → Deep dive: [phase2/README.md](phase2/README.md)
 
-### Phase 3 — Production-Scale Code Pretraining
+### Phase 3 — Production-Scale Code Pretraining + Fine-Tune
 
-Scales to ~**97M parameters** and Python code. Built on the Phase 2
-architecture with one addition: **gradient checkpointing** (Chen et al.
-2016). Trades ~30 % compute for ~4–5× less peak activation memory —
-essential at this scale on an 8 GB GPU. The flag is off by default
-because the current dims fit unaided; turn it on with `--gradient_checkpointing`.
+Scales to ~**97M parameters**, **2048 context**, Python code. Built on
+the Phase 2 architecture with one addition: **gradient checkpointing**
+(Chen et al. 2016). Trades ~30 % compute for ~4–5× less peak activation
+memory — required at 2048 context on an 8 GB GPU.
 
-**Model config (v2):** `d_model=768, n_heads=12, n_layers=12, max_len=512`
+**Model config:** `d_model=768, n_heads=12, n_layers=12, max_len=2048`
 → ~97M params with tied embeddings.
+
+#### Pretraining
 
 **Data (`data_prep.py`):** Streams `bigcode/the-stack-dedup` Python until
 a configurable `--target-tokens` budget (default 2B). Stages docs to
 `docs.jsonl` on disk so the corpus never lives in RAM. Trains a 16k
 byte-level BPE on a 200k-doc sample, then writes `train.bin` / `val.bin`
 as raw `uint16` arrays (nanoGPT pattern) for zero-copy memory-mapped
-loading.
+loading. Verified actual yield: **2.20 B train tokens**, 10.8 M val
+tokens.
 
-**Training (`pretrain.py`):**
+**Training (`pretrain.py`) — final from-scratch 2048-context recipe:**
 
-| Setting | v2 (current) | v1 (preserved) |
-|---------|--------------|----------------|
-| micro_batch / accum | 4 / 16 → effective 64 → 32 k tok/step | same |
-| total_steps | 60 000 (~1.97 B tokens) | 20 000 (~640 M) |
-| warmup | 2 000 | 1 000 |
-| LR | 3e-4 → 3e-5 cosine | same |
-| weight_decay | 0.1, selective (no decay on norms/embeds) | same |
-| params | ~97 M | 46.7 M |
-| corpus | the-stack-dedup Python, ~2 B unique | the-stack-smol, ~22 M unique |
+| Setting | Value |
+|---------|-------|
+| context (`max_len` / `block_size`) | 2048 |
+| micro_batch · accum → effective | 1 · 64 = **64** (131 k tokens / step) |
+| total_steps | 60 000 → ~7.87 B tokens seen |
+| epochs over corpus | ~3.6 (over 2.20 B train tokens) |
+| warmup | 2 000 |
+| LR | 3e-4 → 3e-5 cosine |
+| weight_decay | 0.1, selective (no decay on norms / embeds) |
+| gradient checkpointing | **on** (required at 2048) |
+| params | ~97 M |
+| corpus | the-stack-dedup Python, ~2.2 B unique |
 
-**Why v2 exists:** the v1 run produced clear overfitting (train PPL 1.34
-vs val PPL 68 at step 20 000) because the token/parameter ratio was ~40×
-below Chinchilla's lower bound. v2 fixes both axes — more data, larger
-model — within an ~40–50 h budget on the 3060 Ti.
+The 512-context v2 attempt was abandoned in favour of this 2048 redo so
+the fine-tune source's typical prompt + response (p90 ≈ 2420 tokens)
+fits. The 46.7M smol-baseline v1 run is preserved on disk for the
+overfitting lesson.
 
 Key engineering: `np.memmap` data loading (zero RAM), random window
 sampling (implicit shuffle), fused AdamW, TF32 matmuls on Ampere, atomic
-checkpoint saves (tmp → rename), JSONL training log.
+checkpoint saves (tmp → rename), JSONL training log, `--force` guard so a
+from-scratch run can't silently clobber an existing `last.pt`.
+
+#### Supervised fine-tune
+
+**Data (`finetune_data_prep.py`):** Source is `open-r1/codeforces-cots`,
+config `solutions_py_decontaminated`. Three substantive choices, all
+forced by inspection of the actual data (see [Lessons](#lessons--schemalength-surprises-caught-by-inspection)):
+
+- **Reasoning = the dataset's `editorial` field** (concise, human-written),
+  NOT the model-generated `<think>...</think>` trace. R1's `<think>`
+  blocks have a ~15 k-token median — far past 2048.
+- **Problem = `description` + `input_format` + `output_format`** joined
+  with blank lines. Drops the Codeforces flavor narrative in
+  `messages[0].content` that would otherwise blow the budget.
+- **Code** is still parsed from the first ```` ```python ```` block
+  after `</think>` in the assistant output. `</think>` is used only as
+  a positional marker for the code search — we don't extract anything
+  between the `<think>` tags.
+
+`finish_reason="length"` is **counted but not filtered** — editorial is
+self-contained, so a length-truncated R1 generation with an intact code
+block is still usable.
+
+Yield after inspection (`finetune_data_v2/meta.json`):
+
+| Setting | Value |
+|---------|-------|
+| Source | `open-r1/codeforces-cots:solutions_py_decontaminated` |
+| Examples | **3 519 train / 185 val** (val_ratio = 0.05) |
+| Context | 2048 |
+| Prompt / response boundary | after opening `<reasoning>\n` tag |
+| Loss | masked cross-entropy (response tokens only) |
+| LR | 2e-5 → 2e-6 cosine |
+| Warmup | 3 % of total steps |
+| Schedule | **2 epochs** (small set → overfitting risk) |
+| micro_batch · accum → effective | 2 · 16 = 32 |
+| Gradient checkpointing | off by default (toggle if OOM at 2048) |
+
+A standalone verification script (`verify_finetune_data.py`) checks two
+invariants over every record — `len(input_ids) == len(loss_mask)` and
+"single 0→1 flip" — and prints decoded previews so the masked region
+can be eyeballed before training starts.
+
+**LeetCode (`greengerong/leetcode`) is NOT a training source** —
+it has no reasoning traces. Reserved for Phase 5 evaluation.
 
 → Deep dive: [phase3/README.md](phase3/README.md)
 
@@ -166,7 +220,8 @@ Python 3.10+ required (`X | Y` union type hints).
 
 1. Accept dataset terms:
    - [bigcode/the-stack-smol](https://huggingface.co/datasets/bigcode/the-stack-smol) (for the v1 baseline)
-   - [bigcode/the-stack-dedup](https://huggingface.co/datasets/bigcode/the-stack-dedup) (for v2)
+   - [bigcode/the-stack-dedup](https://huggingface.co/datasets/bigcode/the-stack-dedup) (for v2 pretrain)
+   - [open-r1/codeforces-cots](https://huggingface.co/datasets/open-r1/codeforces-cots) (for SFT)
 2. Create a Read token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
 3. Add to `.env` at project root: `HF_TOKEN=hf_your_token_here`
 
@@ -203,23 +258,33 @@ Checkpoints → `phase2/checkpoints_lm_v2/best_model.pt`
 
 ### Phase 3
 ```bash
-# Step 1 — data prep (run from phase3/)
+# Step 1 — pretrain data prep (run from phase3/)
 cd phase3
 python data_prep.py                                  # → pretrain_data_v2/ (~2 B tokens)
 python data_prep.py --target-tokens 200_000_000      # smaller smoke run
 
-# Step 2 — pretrain
-python pretrain.py                                   # ~40-50 h on RTX 3060 Ti
+# Step 2 — pretrain (97M params, 2048 context, ~7.87 B tokens seen)
+python pretrain.py                                   # several days on RTX 3060 Ti
 python pretrain.py --resume                          # resume from last.pt
-python pretrain.py --gradient_checkpointing          # OOM rescue (~30 % slower, ~4× less VRAM)
-python pretrain.py --micro_batch 2 --total_steps 100 # quick sanity check
+python pretrain.py --force                           # from-scratch even though last.pt exists
+python pretrain.py --micro_batch 1 --total_steps 100 # quick sanity check
+
+# Step 3 — SFT data prep (CPU-only, safe to run while pretrain still going)
+python finetune_data_prep.py                         # → finetune_data_v2/ (~3.5 k train examples)
+python verify_finetune_data.py                       # sanity-check loss mask + decode previews
+
+# Step 4 — supervised fine-tune (uses pretrain best.pt)
+python finetune.py                                   # 2 epochs, ~minutes-to-hours
+python finetune.py --resume                          # resume from FT last.pt
+python finetune.py --gradient_checkpointing          # OOM rescue
 ```
 
 `pretrain_data_v2/` contains `bpe_tokenizer.json`, `train.bin`, `val.bin`,
 `meta.json`, and a kept-by-default `docs.jsonl` staging file.
-Checkpoints → `phase3/checkpoints_pretrain_v2/last.pt` (every 1 000 steps)
-and `best.pt` (on best val).
-Training log → `phase3/checkpoints_pretrain_v2/log.jsonl`.
+Pretrain checkpoints → `phase3/checkpoints_pretrain_v2/last.pt` (every
+1 000 steps) and `best.pt` (on best val).
+SFT checkpoints → `phase3/checkpoints_finetune_v2/{last,best}.pt`.
+Both runs emit `log.jsonl` alongside their checkpoints.
 
 > Re-running the **v1 baseline** is still possible from git history:
 > `git show <pre-v2-commit>:phase3/data_prep.py` produces the smol-pipeline
@@ -265,8 +330,12 @@ Phase 3 v1 (46.7M params, 22M-token smol corpus, 20k steps): finished
 with train loss 0.29 / val loss 4.16 — clearly overfit, exactly what
 motivated the v2 redo.
 
-Phase 3 v2 (97M params, 2B-token Stack corpus, 60k steps): training run
-in progress.
+Phase 3 v2 — final config (97M params, 2048 context, 2.20 B-token
+Stack-dedup Python corpus, 60 k steps ≈ 7.87 B tokens seen ≈ ~3.6
+epochs): pretraining from scratch with gradient checkpointing on. SFT
+corpus (`finetune_data_v2/`) is prepped and verified: 3 519 train / 185
+val examples from `open-r1/codeforces-cots:solutions_py_decontaminated`,
+ready to run after pretrain finishes.
 
 ---
 
@@ -274,12 +343,82 @@ in progress.
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| 3 (fine-tune) | SFT on LeetCode + USACO + Codeforces with CoT traces (GPT-4o distillation where missing) | not started |
-| 4 (RL) | GRPO with code-execution test-case reward (DeepSeek-R1 recipe) | not started |
-| 5 (eval) | pass@1 / pass@k on held-out LeetCode + HumanEval | not started |
+| 3 (fine-tune) | SFT on `open-r1/codeforces-cots:solutions_py_decontaminated`, editorial-as-reasoning (3 519 train / 185 val examples at 2048 context) | data prep done; awaiting pretrain completion |
+| 4 (RL) | GRPO with code-execution test-case reward, using `public_tests`/`private_tests` from the same FT source (DeepSeek-R1 recipe) | not started |
+| 5 (eval) | pass@1 / pass@k on held-out LeetCode (`greengerong/leetcode`) + HumanEval | not started |
 
 None of these require architecture changes — they layer on top of the
 pretrained checkpoint.
+
+---
+
+## Lessons — schema/length surprises caught by inspection
+
+Three assumptions in the original plan turned out to be wrong about the
+actual data. All three were caught by **inspecting the dataset before
+writing the loader**, not by debugging silent garbage afterward.
+
+1. **`bigcode/the-stack-smol` layout: parquet shards → a single JSON file.**
+   The original plan assumed `data/python/*.parquet` shards. The repo
+   actually exposes `data/python/data.json` (one file, no shards). The
+   fix in [phase3/data_prep.py](phase3/data_prep.py) uses
+   `hf_hub_download` → `load_dataset("json", data_files=…)` instead of
+   the parquet / script loaders. The v2 corpus moved to
+   `bigcode/the-stack-dedup` and avoids the issue entirely.
+
+2. **`open-r1/codeforces` has no reasoning traces.** The original plan
+   named it as the SFT source. On inspection the dataset has only
+   problems and solutions, no chain-of-thought. The correct source is
+   `open-r1/codeforces-cots` config `solutions_py_decontaminated`, which
+   has both R1 traces *and* a separate human-written `editorial` field
+   per row. [phase3/finetune_data_prep.py](phase3/finetune_data_prep.py)
+   is built against that schema.
+
+3. **R1 `<think>` traces median ~15 k tokens → editorial + 2048 redesign.**
+   After loading `codeforces-cots`, the assistant outputs' `<think>`
+   sections had a ~15 k-token median — orders of magnitude past any
+   reasonable context window. Two redesigns followed: (a) use the
+   `editorial` field as reasoning instead of `<think>`; (b) bump pretrain
+   context from 512 to 2048 and rerun from scratch so the trimmed
+   `problem` + `editorial` + `code` typical example (p50 = 1 278 tokens,
+   p90 = 2 420 tokens) actually fits. The 512-context partial pretrain
+   run was discarded; the [pretrain.py](phase3/pretrain.py) `--force`
+   guard protects against accidentally clobbering prior checkpoints
+   during the redo.
+
+---
+
+## Appendix B — Pretrain vs Fine-tune recipe comparison
+
+Side-by-side of the two Phase 3 training stages. Both use the same model
+(`GPTv3`, 97M params, 2048 context) and the same `pretrain_data_v2/bpe_tokenizer.json`.
+
+|                                  | Pretrain (`pretrain.py`)                          | Fine-tune (`finetune.py`)                           |
+|----------------------------------|---------------------------------------------------|------------------------------------------------------|
+| **Source**                       | `bigcode/the-stack-dedup` Python                  | `open-r1/codeforces-cots:solutions_py_decontaminated` |
+| **Examples / tokens**            | ~2.20 B train tokens (uint16 memmap)              | 3 519 train / 185 val examples (JSONL)               |
+| **Objective**                    | next-token prediction                             | next-token, **response-masked**                      |
+| **Loss**                         | plain cross-entropy                               | plain cross-entropy w/ `ignore_index=-100` on prompt |
+| **Context** (`max_len`)          | 2048                                              | 2048                                                 |
+| **LR (max → min)**               | 3e-4 → 3e-5 cosine                                | 2e-5 → 2e-6 cosine                                   |
+| **Warmup**                       | 2 000 steps                                       | **3 %** of total steps                               |
+| **Optimiser**                    | AdamW fused, β=(0.9, 0.95), wd=0.1, selective     | AdamW, β=(0.9, 0.95), wd=0.1, selective              |
+| **micro_batch · accum → effective** | 1 · 64 = **64**                              | 2 · 16 = **32**                                      |
+| **Tokens / step**                | 131 k                                             | varies (padded batches)                              |
+| **Schedule**                     | 60 000 steps (~7.87 B tokens, ~3.6 epochs)        | **2 epochs** (overfit risk on the small set)         |
+| **Precision**                    | bf16 autocast                                     | bf16 autocast                                        |
+| **Gradient checkpointing**       | **on** (required at 2048)                         | off (toggleable; first OOM fallback)                 |
+| **Sampler**                      | random window (memmap)                            | shuffled DataLoader, dynamic padding                 |
+| **Generation during sampling**   | KV-cache, top-k=40, temperature=0.8               | KV-cache, top-k=40, temperature=0.7                  |
+| **Output dir**                   | `checkpoints_pretrain_v2/`                        | `checkpoints_finetune_v2/`                           |
+
+Why the LR drops 15× from pretrain to FT: pretrained weights are already
+in a good basin; SFT adapts them rather than searching anew. Standard
+practice across LLaMA, Mistral, Qwen fine-tunes.
+
+Why effective batch shrinks (64 → 32): fewer training examples and
+shorter run, so each gradient should be more aggressive at finding the
+local minimum without averaging out across too many examples.
 
 ---
 
