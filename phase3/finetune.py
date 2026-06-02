@@ -76,10 +76,30 @@ class FTConfig:
     pretrain_ckpt: str = "checkpoints_pretrain_v2/best.pt"
     out_dir: str = "checkpoints_finetune_v2"
 
+    # ── Context window ───────────────────────────────────────────────────────
+    # Documentary: the model's actual max_len is loaded from the pretrain
+    # checkpoint's model_cfg. This field exists so the FT config
+    # self-declares the context length it's tuned for, and so the
+    # micro_batch / grad_accum / gradient_checkpointing defaults below have
+    # an explicit value to refer to.
+    max_len: int = 2048
+
     # ── Schedule ─────────────────────────────────────────────────────────────
-    epochs: int = 3
-    micro_batch_size: int = 8     # fits comfortably at max_len=512 / 97M model
-    grad_accum_steps: int = 4     # effective batch 32
+    # epochs lowered from 3 to 2: the SFT set is small (~3,519 train
+    # examples after the 2048 length filter) so a third epoch is high-risk
+    # for overfitting onto the editorial style. Watch val_loss; bump only
+    # if val is still falling at the end of epoch 2.
+    epochs: int = 2
+    # micro_batch / grad_accum tuned for 2048-context / 97M model on 8 GB.
+    # At 2048 the 4096-token attention matrix and the wider activations
+    # mean fewer examples fit per step than the 512-context FT used.
+    # Memory at micro_batch=2, seq=2048, gradient_checkpointing=False is
+    # estimated around 4-6 GB on a 3060 Ti — fits, but tight. If you OOM:
+    #   1) flip gradient_checkpointing=True (~30% slower, ~4-5x less activation mem)
+    #   2) drop micro_batch_size to 1 and double grad_accum to 32
+    # (keeping the effective batch of 32 stable across either knob).
+    micro_batch_size: int = 2
+    grad_accum_steps: int = 16    # effective batch 32 (was 8*4=32 at 512 context)
     log_interval: int = 20
     eval_interval: int = 200      # eval every N optimizer steps
     sample_interval: int = 400
@@ -97,7 +117,10 @@ class FTConfig:
     # ── Misc ─────────────────────────────────────────────────────────────────
     seed: int = 42
     use_amp: bool = True
-    gradient_checkpointing: bool = False  # turn on if OOM
+    # Off by default at 2048 — the micro_batch=2 / no-checkpointing combo
+    # is the fastest path that fits. Flip on if you OOM (first fallback;
+    # see comment on micro_batch_size).
+    gradient_checkpointing: bool = False
 
 
 # ===========================================================================
