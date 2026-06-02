@@ -44,7 +44,7 @@ Recipe summary
   d_model=768, n_heads=12, n_layers=12 → ~97M params
   block_size=2048, micro_batch=1, accum=64 → effective batch=64, 131k tok/step
   max_lr=3e-4, min_lr=3e-5, weight_decay=0.1
-  total_steps=60000 → ~7.87B tokens seen (~4 epochs of a 2B corpus)
+  total_steps=60000 → ~7.87B tokens seen (~3.6 epochs of a 2.2B corpus)
   gradient_checkpointing=True (required for 2048 context on 8 GB)
 
 Wall-clock estimate (RTX 3060 Ti)
