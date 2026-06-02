@@ -42,15 +42,20 @@ Features (unchanged from the smol-baseline pipeline)
 Recipe summary
 --------------
   d_model=768, n_heads=12, n_layers=12 → ~97M params
-  block_size=512, micro_batch=4, accum=16 → effective batch=64, 32k tok/step
+  block_size=2048, micro_batch=1, accum=64 → effective batch=64, 131k tok/step
   max_lr=3e-4, min_lr=3e-5, weight_decay=0.1
-  total_steps=60000 → ~1.97B tokens seen (~1 epoch of a 2B corpus)
+  total_steps=60000 → ~7.87B tokens seen (~4 epochs of a 2B corpus)
+  gradient_checkpointing=True (required for 2048 context on 8 GB)
 
 Wall-clock estimate (RTX 3060 Ti)
 ---------------------------------
-At ~36k tok/s with the 46.7M model we saw ~10h for 20k steps. The 97M
-target is ~2x more FLOPs per step; expect ~40-50 hours for 60k steps.
-Use --total_steps to scale up or down for shorter experiments.
+At 512 context the 97M model ran ~22k tok/s. The 2048 context move adds:
+  - 4x tokens per step from the longer block,
+  - ~30% compute overhead from gradient checkpointing,
+  - ~4x larger attention matrix (mitigated by FlashAttention's O(n) memory).
+Net: expect roughly 5x the 512-context wall-clock per step. 60k steps at
+2048 ≈ several days on a 3060 Ti. Use --total_steps to scale down for
+shorter experiments.
 
 Dependencies:
     pip install tokenizers numpy
@@ -107,17 +112,16 @@ class TrainConfig:
     d_model: int = 768
     n_heads: int = 12
     n_layers: int = 12
-    max_len: int = 512        # context length during training (kept from v1)
+    max_len: int = 2048       # context length during training (bumped from 512)
     dropout: float = 0.0
     rope_base: float = 10000.0
     norm_eps: float = 1e-5
-    gradient_checkpointing: bool = False   # turn on if OOM at micro_batch=4
-
+    gradient_checkpointing: bool = False   
     # ── Training ─────────────────────────────────────────────────────────────
-    block_size: int = 512
-    micro_batch_size: int = 4
-    grad_accum_steps: int = 16   # effective batch size = micro · accum = 64
-    total_steps: int = 60_000    # ~1.97B tokens, ~1 epoch over a 2B corpus
+    block_size: int = 2048
+    micro_batch_size: int = 2   
+    grad_accum_steps: int = 32  
+    total_steps: int = 60_000    
     eval_interval: int = 500
     eval_iters: int = 100        # number of val batches per eval
     log_interval: int = 20
@@ -327,11 +331,27 @@ def load_checkpoint(path: Path, model: GPTv3,
 # ===========================================================================
 # 9. Main training loop
 # ===========================================================================
-def train(cfg: TrainConfig, resume: bool) -> None:
+def train(cfg: TrainConfig, resume: bool, force: bool = False) -> None:
     # ── Setup ────────────────────────────────────────────────────────────────
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "log.jsonl"
+
+    # Guard: a from-scratch run (resume=False) that lands in a directory
+    # which already contains a last.pt would silently clobber that
+    # checkpoint on the first save_checkpoint() call. Require --force to
+    # acknowledge this. (--resume bypasses the guard by construction.)
+    last_ckpt = out_dir / "last.pt"
+    if not resume and last_ckpt.exists() and not force:
+        raise SystemExit(
+            f"\n{last_ckpt} already exists.\n"
+            f"This looks like a from-scratch run that would overwrite an "
+            f"existing checkpoint.\n"
+            f"  - To continue the existing run, pass --resume.\n"
+            f"  - To start fresh anyway (and overwrite), pass --force.\n"
+            f"  - To preserve the existing checkpoints, move them aside first:\n"
+            f"      mv {out_dir} {out_dir}_old"
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = cfg.use_amp and device.type == "cuda"
@@ -517,7 +537,11 @@ def train(cfg: TrainConfig, resume: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", action="store_true",
-                        help="Resume from checkpoints_pretrain/last.pt")
+                        help="Resume from checkpoints_pretrain_v2/last.pt")
+    parser.add_argument("--force", action="store_true",
+                        help="Allow a from-scratch run to overwrite an existing "
+                             "last.pt in out_dir. Required when starting fresh "
+                             "in a directory that already contains a checkpoint.")
     parser.add_argument("--gradient_checkpointing", action="store_true",
                         help="Enable gradient checkpointing (slower, less VRAM)")
     parser.add_argument("--micro_batch", type=int, default=None)
@@ -535,7 +559,7 @@ def main() -> None:
     if args.total_steps is not None:
         cfg.total_steps = args.total_steps
 
-    train(cfg, resume=args.resume)
+    train(cfg, resume=args.resume, force=args.force)
 
 
 if __name__ == "__main__":

@@ -1,62 +1,86 @@
 """
 saLLMan Phase 3 (fine-tune) — data prep for supervised fine-tuning.
 
-Builds an instruction-tuning corpus from problem-solving datasets that
-already contain chain-of-thought reasoning traces:
+Source (verified)
+-----------------
+  open-r1/codeforces-cots, config 'solutions_py_decontaminated', split 'train'.
+  Each row is a Codeforces problem with a DeepSeek-R1 chain-of-thought trace,
+  a Python solution, and a separate human-written editorial.
 
-  - open-r1/codeforces           Codeforces problems with DeepSeek-R1
-                                 reasoning traces.
-  - greengerong/leetcode         LeetCode problems with solutions.
-                                 Used only if a reasoning/explanation
-                                 field is present in the schema —
-                                 otherwise skipped (per the "only datasets
-                                 with reasoning" preference).
+Verified schema (treated as ground truth — no field-name probing):
+  Per-problem fields:
+    description     str — task statement
+    input_format    str — input specification
+    output_format   str — output specification
+    editorial       str — concise human-written reasoning / approach summary
+  Generation fields:
+    messages        list[dict], len == 2
+      messages[0]   = {"role":"user",      "content": <full problem>}
+      messages[1]   = {"role":"assistant", "content": <R1 output>}
+    generation      str — equal to messages[1].content (used as fallback)
+    finish_reason   str — "stop" | "length" | ...  (informational, NOT a filter)
+  Test fields (consumed by Phase 4 GRPO, ignored here):
+    public_tests, private_tests, generated_tests
 
-The output format (per the chosen tagged-sections convention):
+What we use from each row
+-------------------------
+  problem    = description + "\\n\\n" + input_format + "\\n\\n" + output_format
+               (drops the Codeforces "story" wrapper in messages[0].content
+                that bloats most rows past 2048 tokens)
+  reasoning  = editorial
+               (the R1 <think> trace has a ~15k-token median — far past the
+                2048 context; editorial is the budgeted human-written
+                replacement)
+  code       = first "```python ... ```" block AFTER "</think>" in the
+               assistant output (or 'generation' as fallback). "</think>"
+               is used only as a positional marker; we do NOT extract
+               anything between the <think> tags.
+
+finish_reason is NOT a filter
+-----------------------------
+We don't skip rows with finish_reason="length". Reasoning comes from
+editorial, not from the assistant output, so a length-truncated R1
+generation is fine as long as it still has a well-formed ```python block.
+The fence parser validates that. We do still COUNT the finish_reason
+distribution for visibility — surprises in that distribution are worth
+seeing.
+
+Output format (tagged sections — no new special tokens needed):
     <problem>
-    {problem text}
+    {trimmed problem text}
     </problem>
-    <reasoning>
-    {chain-of-thought}
+    <reasoning>           ← prompt ends here, response begins
+    {editorial}
     </reasoning>
     <code>
-    {final solution code}
+    {solution}
     </code><eos>
-
-Why tagged sections rather than ChatML / new special tokens:
-  - Plain text means the pretrained tokenizer doesn't need extending.
-  - The model has never seen these tags, but it has seen lots of
-    XML-style markup during pretraining (the Stack contains HTML, JSX,
-    docstrings) — it will pick up on them as boundary signals quickly.
-  - We control where the response starts (right after the first
-    "<reasoning>\n") which lets us mask loss on the prompt cleanly.
 
 Loss masking
 ------------
-We tokenize prompt and response *separately* so we know the exact
-boundary in id space:
-    input_ids  = prompt_ids + response_ids
-    loss_mask  = [0] * len(prompt_ids) + [1] * len(response_ids)
+Prompt and response are tokenized separately so the boundary in id space is
+bit-exact:
+    input_ids = [BOS] + prompt_ids + response_ids + [EOS]
+    loss_mask = [0]   + [0]*L_p    + [1]*L_r      + [1]
 At training time, positions with loss_mask=0 are replaced with -100 in
-labels so `F.cross_entropy(ignore_index=-100)` skips them.
+labels so F.cross_entropy(ignore_index=-100) skips them.
 
-Output format
--------------
-JSONL files, one example per line:
-    {"input_ids": [int, ...], "loss_mask": [0/1, ...]}
-Plus a `meta.json` with example counts, source breakdown, and the
-tokenizer path used.
+JSONL output (one example per line):
+    {"input_ids": [int, ...], "loss_mask": [0/1, ...], "source": "..."}
 
-Datasets are small (~10s of MB after tokenization) so we DON'T use
-memmap here. A plain JSON read in finetune.py is fine.
+Verified length stats with this trim+editorial form:
+  p50 = 1278 tokens, p90 = 2420 tokens
+  ~3846 of 4660 candidate rows fit at max_len=2048.
+
+LeetCode is intentionally NOT a training source — it has no reasoning
+traces. Reserved for Phase 5 evaluation.
 
 Usage
 -----
     cd phase3
     python finetune_data_prep.py
     python finetune_data_prep.py --out finetune_data_v2 \\
-                                 --tokenizer pretrain_data_v2/bpe_tokenizer.json \\
-                                 --max-len 512
+                                 --tokenizer pretrain_data_v2/bpe_tokenizer.json
 """
 from __future__ import annotations
 
@@ -64,11 +88,11 @@ import argparse
 import json
 import os
 import random
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterator
 
-from datasets import load_dataset, Dataset, DatasetDict
+from datasets import Dataset, load_dataset
 from dotenv import load_dotenv
 from tokenizers import Tokenizer
 from tqdm import tqdm
@@ -92,141 +116,257 @@ CODE_CLOSE    = "\n</code>"
 
 
 # ---------------------------------------------------------------------------
-# Per-source extractors
+# Extractor stats — caller-owned so the summary remains valid even if
+# iteration is interrupted (exception mid-tokenize, future head/limit, etc).
+#
+# Two independent partitions of n_rows_seen are tracked:
+#
+#   (1) finish_reason distribution     — informational, every row contributes
+#       n_finish_stop + n_finish_length + n_finish_other == n_rows_seen
+#
+#   (2) outcome partition              — every row ends in exactly one of:
+#       n_yielded OR one of the skip_* buckets, summing to n_rows_seen.
+#
+# Both invariants are asserted at print time.
 # ---------------------------------------------------------------------------
-# Each extractor returns an iterator of (problem, reasoning, code) triples.
-# If a source's schema doesn't expose reasoning, we either skip the source
-# (require_reasoning=True) or yield reasoning="" (False).
+@dataclass
+class ExtractStats:
+    n_rows_seen:                int = 0
+    n_yielded:                  int = 0
+    n_used_generation_fallback: int = 0
 
-def extract_open_r1_codeforces(ds: Dataset) -> Iterator[tuple[str, str, str]]:
+    # Informational — distribution of finish_reason across ALL rows seen,
+    # not just yielded ones. NOT a skip filter.
+    n_finish_stop:              int = 0
+    n_finish_length:            int = 0
+    n_finish_other:             int = 0
+
+    # Skip buckets (part of the outcome partition).
+    skip_no_editorial:          int = 0
+    skip_no_description:        int = 0
+    skip_no_input_format:       int = 0
+    skip_no_output_format:      int = 0
+    skip_malformed_msgs:        int = 0
+    skip_no_think_close:        int = 0
+    skip_no_py_fence:           int = 0
+    skip_unclosed_fence:        int = 0
+    skip_empty_code:            int = 0
+
+
+def print_extract_stats(name: str, s: ExtractStats) -> None:
     """
-    open-r1/codeforces schema (as of 2026): each row contains a Codeforces
-    problem statement, plus DeepSeek-R1 generated reasoning traces and a
-    final solution. Column names have varied across releases of this
-    dataset; we probe several common ones and assemble robustly.
+    Print a fixed-width summary and assert both row-accounting invariants.
 
-    Expected fields (any of these may appear):
-      problem text:  one of [`problem`, `problem_statement`, `description`]
-      reasoning:     one of [`reasoning`, `generation`, `thought`, `chain_of_thought`]
-      solution code: one of [`solution`, `code`, `submission`, `answer`]
-      messages:      sometimes the whole thing is a list of role/content dicts
+    A future refactor that adds a new skip branch without a counter will
+    trip the outcome-partition assertion; a future refactor that adds a
+    new finish_reason bucket without updating the three-way tally will
+    trip the finish-reason invariant.
     """
-    cols = set(ds.column_names)
-
-    # Path A: column-style schema
-    p_key = next((k for k in ("problem", "problem_statement", "description") if k in cols), None)
-    r_key = next((k for k in ("reasoning", "generation", "thought", "chain_of_thought") if k in cols), None)
-    c_key = next((k for k in ("solution", "code", "submission", "answer") if k in cols), None)
-
-    if p_key and (r_key or "messages" in cols) and c_key:
-        for row in ds:
-            problem = (row.get(p_key) or "").strip()
-            code = (row.get(c_key) or "").strip()
-            if r_key:
-                reasoning = (row.get(r_key) or "").strip()
-            else:
-                # Messages-style: concatenate assistant turns as reasoning.
-                msgs = row.get("messages") or []
-                reasoning = "\n".join(m.get("content", "").strip()
-                                      for m in msgs if m.get("role") == "assistant").strip()
-            if problem and reasoning and code:
-                yield problem, reasoning, code
-        return
-
-    # Path B: messages-only schema (single conversation per row)
-    if "messages" in cols:
-        for row in ds:
-            msgs = row.get("messages") or []
-            user_parts = [m["content"] for m in msgs if m.get("role") == "user"]
-            asst_parts = [m["content"] for m in msgs if m.get("role") == "assistant"]
-            if not user_parts or not asst_parts:
-                continue
-            problem = "\n\n".join(user_parts).strip()
-            # Heuristic: last assistant turn = code; everything before = reasoning.
-            reasoning = "\n\n".join(asst_parts[:-1]).strip() or asst_parts[-1].strip()
-            code = asst_parts[-1].strip()
-            if problem and reasoning and code:
-                yield problem, reasoning, code
-        return
-
-    raise RuntimeError(
-        f"open-r1/codeforces: unknown schema. Columns: {sorted(cols)}. "
-        "Inspect the dataset on HF and update extract_open_r1_codeforces."
+    total_skipped = (
+        s.skip_no_editorial
+        + s.skip_no_description
+        + s.skip_no_input_format
+        + s.skip_no_output_format
+        + s.skip_malformed_msgs
+        + s.skip_no_think_close
+        + s.skip_no_py_fence
+        + s.skip_unclosed_fence
+        + s.skip_empty_code
+    )
+    assert s.n_yielded + total_skipped == s.n_rows_seen, (
+        f"outcome partition mismatch: yielded={s.n_yielded} + "
+        f"skipped={total_skipped} != seen={s.n_rows_seen}"
+    )
+    finish_total = s.n_finish_stop + s.n_finish_length + s.n_finish_other
+    assert finish_total == s.n_rows_seen, (
+        f"finish_reason partition mismatch: "
+        f"stop+length+other={finish_total} != seen={s.n_rows_seen}"
     )
 
+    print(f"\n  {name} extraction over {s.n_rows_seen:,} rows:")
+    print(f"      yielded:                              {s.n_yielded:,}")
+    print(f"      used 'generation' fallback:           {s.n_used_generation_fallback:,}")
+    print(f"    finish_reason distribution (informational, not a filter):")
+    print(f"      stop:                                 {s.n_finish_stop:,}")
+    print(f"      length:                               {s.n_finish_length:,}")
+    print(f"      other:                                {s.n_finish_other:,}")
+    print(f"    skip buckets:")
+    print(f"      skip (no editorial):                  {s.skip_no_editorial:,}")
+    print(f"      skip (no description):                {s.skip_no_description:,}")
+    print(f"      skip (no input_format):               {s.skip_no_input_format:,}")
+    print(f"      skip (no output_format):              {s.skip_no_output_format:,}")
+    print(f"      skip (malformed messages):            {s.skip_malformed_msgs:,}")
+    print(f"      skip (no </think>):                   {s.skip_no_think_close:,}")
+    print(f"      skip (no ```python after </think>):   {s.skip_no_py_fence:,}")
+    print(f"      skip (unclosed ``` fence):            {s.skip_unclosed_fence:,}")
+    print(f"      skip (empty code):                    {s.skip_empty_code:,}")
 
-def extract_greengerong_leetcode(
+
+# ---------------------------------------------------------------------------
+# Source loader
+# ---------------------------------------------------------------------------
+def try_load_open_r1_codeforces_cots(hf_token: str | None) -> Dataset | None:
+    """
+    Load open-r1/codeforces-cots, config 'solutions_py_decontaminated',
+    train split. Returns None on load failure so the caller can report
+    cleanly rather than the whole script crashing on an HF outage.
+    """
+    print("[load] open-r1/codeforces-cots (solutions_py_decontaminated) ...")
+    try:
+        d = load_dataset(
+            "open-r1/codeforces-cots",
+            "solutions_py_decontaminated",
+            split="train",
+            token=hf_token,
+        )
+    except Exception as e:
+        print(f"  ! failed to load open-r1/codeforces-cots: {e}")
+        return None
+    print(f"      rows: {len(d):,}, columns: {d.column_names}")
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Problem-text assembly
+# ---------------------------------------------------------------------------
+def build_trimmed_problem(description: str, input_format: str, output_format: str) -> str:
+    """
+    Build the trimmed problem text from three structured Codeforces fields:
+      description     — the actual task statement
+      input_format    — input specification
+      output_format   — output specification
+    Joined with blank lines (no headers, no flavor narrative).
+
+    Verified length stats with this trimmed form + the editorial as reasoning:
+      p50 = 1278 tokens
+      p90 = 2420 tokens
+      ~3846 of 4660 candidate rows fit at max_len=2048.
+
+    The full messages[0].content includes a Codeforces "story" wrapper that
+    pushes most rows well past 2048; this trimmed form is the budgeted
+    replacement.
+    """
+    return "\n\n".join([description.strip(), input_format.strip(), output_format.strip()])
+
+
+# ---------------------------------------------------------------------------
+# Extractor
+# ---------------------------------------------------------------------------
+def extract_open_r1_codeforces_cots(
     ds: Dataset,
-    require_reasoning: bool,
+    stats: ExtractStats,
 ) -> Iterator[tuple[str, str, str]]:
     """
-    greengerong/leetcode schema:
-      slug, title, content, difficulty, solution, hints, ...
-    `content` is the problem statement, `solution` typically contains a
-    Python implementation. There is sometimes no explicit reasoning field,
-    in which case (with require_reasoning=True) we skip the source.
+    Yield (problem, reasoning, code) triples.
 
-    Heuristic: if `solution` contains both prose and code blocks, we treat
-    everything before the first code fence as reasoning. This is what most
-    LeetCode editorial-style entries look like.
+    Sources, per the verified schema:
+      problem    = build_trimmed_problem(description, input_format, output_format)
+      reasoning  = row["editorial"]                  ← concise, human-written
+      code       = first ```python block AFTER "</think>" in messages[1].content
+                   (with row["generation"] as fallback when content is empty).
+
+    The R1 <think>...</think> trace is intentionally NOT used as reasoning —
+    its median length is ~15k tokens, far past a 2048 context. We still
+    need "</think>" as a positional marker to locate the first ```python
+    fence reliably; we don't extract anything between the tags.
+
+    finish_reason is COUNTED but NOT used as a filter. Editorial gives us a
+    self-contained reasoning trace, so a length-truncated R1 generation
+    that still has a well-formed code block is usable.
+
+    Skip rules (every row ends in exactly one of these buckets OR n_yielded):
+      - editorial empty                         → skip_no_editorial
+      - description empty                       → skip_no_description
+      - input_format empty                      → skip_no_input_format
+      - output_format empty                     → skip_no_output_format
+      - messages malformed / output empty       → skip_malformed_msgs
+      - "</think>" missing                      → skip_no_think_close
+      - "```python" missing after "</think>"    → skip_no_py_fence
+      - "```" closer missing                    → skip_unclosed_fence
+      - code empty after stripping              → skip_empty_code
     """
-    cols = set(ds.column_names)
-    p_key = next((k for k in ("content", "description", "problem") if k in cols), None)
-    s_key = next((k for k in ("solution", "python", "code") if k in cols), None)
-
-    if p_key is None or s_key is None:
-        print(f"  ! greengerong/leetcode: no usable columns "
-              f"(have: {sorted(cols)}); skipping source.")
-        return
-
-    n_with_reason = 0
-    n_without_reason = 0
+    THINK_CLOSE = "</think>"
+    PY_FENCE    = "```python"
+    FENCE_CLOSE = "```"
 
     for row in ds:
-        problem = (row.get(p_key) or "").strip()
-        full_sol = (row.get(s_key) or "").strip()
-        if not problem or not full_sol:
+        stats.n_rows_seen += 1
+
+        # Tally finish_reason for visibility — informational, not a filter.
+        fr = row.get("finish_reason")
+        if fr == "stop":
+            stats.n_finish_stop += 1
+        elif fr == "length":
+            stats.n_finish_length += 1
+        else:
+            stats.n_finish_other += 1
+
+        # Cheap field-level filters first.
+        editorial = (row.get("editorial") or "").strip()
+        if not editorial:
+            stats.skip_no_editorial += 1
             continue
 
-        # Try to split prose-reasoning from code by a fenced code block.
-        reasoning, code = _split_prose_and_code(full_sol)
-        if reasoning:
-            n_with_reason += 1
-            yield problem, reasoning, code
-        else:
-            n_without_reason += 1
-            if require_reasoning:
-                continue
-            yield problem, "", full_sol
+        description = (row.get("description") or "").strip()
+        if not description:
+            stats.skip_no_description += 1
+            continue
+        input_format = (row.get("input_format") or "").strip()
+        if not input_format:
+            stats.skip_no_input_format += 1
+            continue
+        output_format = (row.get("output_format") or "").strip()
+        if not output_format:
+            stats.skip_no_output_format += 1
+            continue
 
-    print(f"  greengerong/leetcode: kept {n_with_reason} with reasoning, "
-          f"{'skipped' if require_reasoning else 'kept-as-empty-reasoning'} "
-          f"{n_without_reason}")
+        # Messages → assistant output (code source only).
+        msgs = row.get("messages") or []
+        if not (
+            len(msgs) >= 2
+            and isinstance(msgs[0], dict) and msgs[0].get("role") == "user"
+            and isinstance(msgs[1], dict) and msgs[1].get("role") == "assistant"
+        ):
+            stats.skip_malformed_msgs += 1
+            continue
 
+        output = (msgs[1].get("content") or "").strip()
+        if not output:
+            output = (row.get("generation") or "").strip()
+            if output:
+                stats.n_used_generation_fallback += 1
+        if not output:
+            stats.skip_malformed_msgs += 1
+            continue
 
-def _split_prose_and_code(text: str) -> tuple[str, str]:
-    """
-    Best-effort split of an editorial-style answer into (prose, code).
-    If a ```python ... ``` (or generic ```...```) fence is present, prose
-    is everything before the first fence and code is the first fenced
-    block. If no fence is found, returns ("", text) — caller decides.
-    """
-    fence_marker_long = "```python"
-    if fence_marker_long in text:
-        before, _, after = text.partition(fence_marker_long)
-        code_block, _, _rest = after.partition("```")
-        return before.strip(), code_block.strip()
+        # Locate </think> only as a positional marker for the code search.
+        close_idx = output.find(THINK_CLOSE)
+        if close_idx == -1:
+            stats.skip_no_think_close += 1
+            continue
+        after_think = output[close_idx + len(THINK_CLOSE):]
 
-    if "```" in text:
-        before, _, after = text.partition("```")
-        # Drop any leading language hint like "python\n"
-        first_line, _, rest = after.partition("\n")
-        if first_line.strip().isalpha():
-            after = rest
-        code_block, _, _rest = after.partition("```")
-        return before.strip(), code_block.strip()
+        fence_open = after_think.find(PY_FENCE)
+        if fence_open == -1:
+            stats.skip_no_py_fence += 1
+            continue
+        code_start = fence_open + len(PY_FENCE)
+        # Skip a single newline immediately after the fence marker.
+        if code_start < len(after_think) and after_think[code_start] == "\n":
+            code_start += 1
+        fence_close = after_think.find(FENCE_CLOSE, code_start)
+        if fence_close == -1:
+            stats.skip_unclosed_fence += 1
+            continue
+        code = after_think[code_start:fence_close].strip()
+        if not code:
+            stats.skip_empty_code += 1
+            continue
 
-    return "", text.strip()
+        problem = build_trimmed_problem(description, input_format, output_format)
+
+        stats.n_yielded += 1
+        yield problem, editorial, code
 
 
 # ---------------------------------------------------------------------------
@@ -264,15 +404,16 @@ def tokenize_example(
     Encode one (problem, reasoning, code) triple into the JSONL record
     format, or return None if the example doesn't fit in max_len.
 
-    We tokenize prompt and response separately so we can build loss_mask
-    bit-exactly without searching for a delimiter token afterward.
+    Tokenizing prompt and response separately is what gives us a bit-exact
+    boundary in id space; do NOT collapse to a single encode + delimiter
+    search (BPE may merge tags differently depending on neighbours).
 
     Layout:
-        input_ids  = [BOS] + prompt_ids + response_ids + [EOS]
-        loss_mask  = [0]   + [0]*L_p    + [1]*L_r      + [1]
-                                                         ↑ predict EOS too,
-                                                           so generation
-                                                           learns to stop.
+        input_ids = [BOS] + prompt_ids + response_ids + [EOS]
+        loss_mask = [0]   + [0]*L_p    + [1]*L_r      + [1]
+                                                        ↑ predict EOS too,
+                                                          so generation
+                                                          learns to stop.
     """
     prompt_text, response_text = format_prompt_response(problem, reasoning, code)
 
@@ -314,45 +455,20 @@ def write_split(
 
 
 # ---------------------------------------------------------------------------
-# Source loaders — separated so each dataset's quirks live in one place
+# Per-source post-extraction stats (length-filter only — extractor handles
+# all empty/missing-field skips before we ever get here).
 # ---------------------------------------------------------------------------
-def try_load_open_r1_codeforces(hf_token: str | None) -> Dataset | None:
-    """
-    Returns a `Dataset` (train split) or None if loading fails. We don't
-    abort the whole pipeline on a single source failure — open-r1
-    occasionally renames or re-shards the dataset.
-    """
-    print("[load] open-r1/codeforces ...")
-    try:
-        d = load_dataset("open-r1/codeforces", split="train", token=hf_token)
-    except Exception as e:
-        print(f"  ! failed to load open-r1/codeforces: {e}")
-        return None
-    print(f"      rows: {len(d):,}, columns: {d.column_names}")
-    return d
-
-
-def try_load_greengerong_leetcode(hf_token: str | None) -> Dataset | None:
-    print("[load] greengerong/leetcode ...")
-    try:
-        d = load_dataset("greengerong/leetcode", split="train", token=hf_token)
-    except Exception as e:
-        print(f"  ! failed to load greengerong/leetcode: {e}")
-        return None
-    print(f"      rows: {len(d):,}, columns: {d.column_names}")
-    return d
+@dataclass
+class PrepStats:
+    source: str
+    n_kept: int = 0
+    n_dropped_length: int = 0
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-@dataclass
-class PrepStats:
-    source: str
-    n_loaded: int
-    n_kept: int
-    n_dropped_length: int
-    n_dropped_empty: int
+SOURCE_NAME = "open-r1/codeforces-cots:solutions_py_decontaminated"
 
 
 def main() -> None:
@@ -364,18 +480,11 @@ def main() -> None:
         help="Path to the BPE tokenizer trained during pretrain data prep.",
     )
     parser.add_argument(
-        "--max-len", type=int, default=512,
+        "--max-len", type=int, default=2048,
         help="Max sequence length (must match the model's max_len).",
     )
     parser.add_argument("--val-ratio", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--require-reasoning", action="store_true", default=True,
-        help="Skip examples without a non-empty reasoning section "
-             "(default; reflects the 'only datasets with reasoning' choice).",
-    )
-    parser.add_argument("--no-require-reasoning", dest="require_reasoning",
-                        action="store_false")
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -395,69 +504,64 @@ def main() -> None:
     load_dotenv()
     hf_token = os.environ.get("HF_TOKEN")
 
-    sources: list[tuple[str, "Iterator[tuple[str, str, str]] | None"]] = []
-    cf_ds = try_load_open_r1_codeforces(hf_token)
-    if cf_ds is not None:
-        sources.append(("open-r1/codeforces", extract_open_r1_codeforces(cf_ds)))
-    lc_ds = try_load_greengerong_leetcode(hf_token)
-    if lc_ds is not None:
-        sources.append((
-            "greengerong/leetcode",
-            extract_greengerong_leetcode(lc_ds, require_reasoning=args.require_reasoning),
-        ))
+    # ── Load source ─────────────────────────────────────────────────────────
+    cf_ds = try_load_open_r1_codeforces_cots(hf_token)
+    if cf_ds is None:
+        raise SystemExit(
+            "Could not load open-r1/codeforces-cots. Check HF auth and that "
+            "you've accepted the dataset terms at "
+            "https://huggingface.co/datasets/open-r1/codeforces-cots"
+        )
 
-    if not sources:
-        raise SystemExit("No sources loaded — check HF auth and dataset access.")
-
-    # Collect all tokenized examples first, then split. The full corpus is
-    # small (~10s of MB after tokenization) so this fits comfortably in RAM.
+    # ── Extract + tokenize ──────────────────────────────────────────────────
+    # extract_stats is OWNED HERE and passed to the extractor. The summary
+    # remains valid even if the loop below raises or stops early.
+    extract_stats = ExtractStats()
+    prep_stats = PrepStats(source=SOURCE_NAME)
     all_records: list[dict] = []
-    stats: list[PrepStats] = []
 
-    for source_name, triples_iter in sources:
-        print(f"\n[tokenize] {source_name}")
-        n_loaded = n_kept = n_drop_len = n_drop_empty = 0
-        for problem, reasoning, code in tqdm(triples_iter, desc=source_name):
-            n_loaded += 1
-            if not problem or not code:
-                n_drop_empty += 1
-                continue
-            if args.require_reasoning and not reasoning:
-                n_drop_empty += 1
-                continue
+    print(f"\n[tokenize] {SOURCE_NAME}")
+    triples = extract_open_r1_codeforces_cots(cf_ds, extract_stats)
+    try:
+        for problem, reasoning, code in tqdm(triples, desc=SOURCE_NAME):
             rec = tokenize_example(tokenizer, problem, reasoning, code, args.max_len)
             if rec is None:
-                n_drop_len += 1
+                prep_stats.n_dropped_length += 1
                 continue
-            rec["source"] = source_name
+            rec["source"] = SOURCE_NAME
             all_records.append(rec)
-            n_kept += 1
-        stats.append(PrepStats(source_name, n_loaded, n_kept, n_drop_len, n_drop_empty))
-        print(f"      kept: {n_kept:,} / {n_loaded:,} "
-              f"(too long: {n_drop_len:,}, empty/no-reason: {n_drop_empty:,})")
+            prep_stats.n_kept += 1
+    finally:
+        # Always print the extractor summary — even if tokenize_example
+        # raised or the user ^C'd mid-loop.
+        print_extract_stats(SOURCE_NAME, extract_stats)
+        print(f"  post-tokenize (length filter @ max_len={args.max_len}):")
+        print(f"      kept:                                 {prep_stats.n_kept:,}")
+        print(f"      dropped (too long):                   {prep_stats.n_dropped_length:,}")
 
     if not all_records:
         raise SystemExit(
-            "No usable examples after filtering. Try --no-require-reasoning, "
-            "increase --max-len, or check that the source schemas match."
+            "No usable examples after filtering. Inspect the skip counts "
+            "above to diagnose."
         )
 
-    # Length histogram for visibility — handy when tuning max_len later.
-    lens = [len(r["input_ids"]) for r in all_records]
-    print(f"\nLength stats over {len(all_records):,} examples:")
-    print(f"  min={min(lens)}  p50={sorted(lens)[len(lens)//2]}  "
-          f"p95={sorted(lens)[int(len(lens)*0.95)]}  max={max(lens)}")
+    # Length histogram for visibility.
+    lens = sorted(len(r["input_ids"]) for r in all_records)
+    print(f"\nLength stats over {len(lens):,} kept examples:")
+    print(f"  min={lens[0]}  p50={lens[len(lens)//2]}  "
+          f"p95={lens[int(len(lens)*0.95)]}  max={lens[-1]}")
 
-    # Split + write.
+    # ── Split + write ───────────────────────────────────────────────────────
     train_path = args.out / "train.jsonl"
-    val_path = args.out / "val.jsonl"
-    n_train, n_val = write_split(all_records, train_path, val_path,
-                                  args.val_ratio, args.seed)
+    val_path   = args.out / "val.jsonl"
+    n_train, n_val = write_split(
+        all_records, train_path, val_path, args.val_ratio, args.seed,
+    )
     print(f"\nWrote {n_train:,} train / {n_val:,} val examples")
     print(f"  {train_path}")
     print(f"  {val_path}")
 
-    # meta.json
+    # ── meta.json ───────────────────────────────────────────────────────────
     meta = {
         "tokenizer_path": str(args.tokenizer),
         "vocab_size": tokenizer.get_vocab_size(),
@@ -473,13 +577,20 @@ def main() -> None:
         "n_val": n_val,
         "val_ratio": args.val_ratio,
         "seed": args.seed,
-        "sources": [asdict(s) for s in stats],
+        "sources": [
+            {
+                "name": SOURCE_NAME,
+                "extract_stats": asdict(extract_stats),
+                "n_kept": prep_stats.n_kept,
+                "n_dropped_length": prep_stats.n_dropped_length,
+            },
+        ],
     }
     (args.out / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"  {args.out / 'meta.json'}")
 
-    # Sanity preview: detokenize the first train example, showing where
-    # loss_mask flips from 0 to 1 (the prompt → response boundary).
+    # Sanity preview: decode the first train example and locate the
+    # prompt → response boundary (where loss_mask flips 0 → 1).
     print("\nSanity preview of first train example:")
     with train_path.open("r") as f:
         ex = json.loads(f.readline())
@@ -492,7 +603,8 @@ def main() -> None:
     print("  ...")
 
     print("\nDone. Next step:")
-    print(f"    python finetune.py --data {args.out} --pretrain checkpoints_pretrain_v2/best.pt")
+    print(f"    python finetune.py --data {args.out} \\")
+    print(f"                       --pretrain checkpoints_pretrain_v2/best.pt")
 
 
 if __name__ == "__main__":
