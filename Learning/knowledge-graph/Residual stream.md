@@ -1,6 +1,6 @@
 # Residual stream
 
-**Cluster:** cross-cutting hub · part of [[saLLMan MOC]]
+**Cluster:** cross-cutting hub · part of [[Home]]
 
 ## Intuition
 The backbone of every Transformer block. Each sub-layer (attention, FFN) *reads from* and *writes back to* a shared residual vector rather than replacing it:

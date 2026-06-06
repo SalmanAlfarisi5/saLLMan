@@ -1,6 +1,6 @@
 # Memory budget
 
-**Cluster:** cross-cutting hub (8 GB RTX 3060 Ti) · part of [[saLLMan MOC]]
+**Cluster:** cross-cutting hub (8 GB RTX 3060 Ti) · part of [[Home]]
 
 ## Why this note exists
 On an 8 GB card the binding constraint is **memory**, not compute. These are the concepts that buy you headroom, gathered in one place so you can see the whole survival kit.

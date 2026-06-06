@@ -6,7 +6,8 @@
 large *effective* batch on limited VRAM. Scale the loss by `1/accum_steps` so the gradient matches
 a single big-batch step.
 
-**In saLLMan.** e.g. micro_batch=1 x accum=64 -> effective batch 64 (131k tokens/step) at 2048
-context. Gradient clipping is applied to the *full accumulated* gradient, after the loop.
+**In saLLMan.** e.g. micro_batch=4 x accum=16 -> effective batch 64 -> 131,072 tokens/step at 2048
+context (4 x 16 x 2048 = 131,072). Gradient clipping is applied to the *full accumulated* gradient,
+after the loop.
 
 **Connects to:** [[Gradient checkpointing]] | [[Mixed precision training]] | [[Memory budget]]

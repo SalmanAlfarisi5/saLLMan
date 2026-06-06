@@ -4,7 +4,7 @@
 
 **Intuition.** A reasoning model that emits explicit `<think>...</think>` traces, trained with
 [[GRPO]] and *rule-based / verifiable* rewards. **R1-Zero** used pure RL with no SFT and reasoning
-emerged spontaneously (AIME 2024 pass@1 rose 15.6% -> 71.0%, 86.7% with majority voting). R1 added
+emerged spontaneously (AIME 2024 pass@1 15.6% -> 71.0%, 86.7% with majority voting). R1 added
 cold-start SFT to fix readability.
 
 **In saLLMan.** The recipe Phase 4 follows; its distilled traces seed [[codeforces-cots]]. The two

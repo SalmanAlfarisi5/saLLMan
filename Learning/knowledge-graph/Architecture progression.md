@@ -1,14 +1,14 @@
 # Architecture progression
 
-**Cluster:** cross-cutting hub · part of [[saLLMan MOC]]
+**Cluster:** cross-cutting hub · part of [[Home]]
 
 ## Intuition
 saLLMan is built as a *progression*, where each phase swaps in components without ever changing the autoregressive [[Next-token prediction]] core:
 
 1. **[[Phase 0 - Vanilla Transformer]]** — the original encoder-decoder Transformer (translation).
 2. **[[Phase 1 - Decoder-only GPT]]** — drop the encoder + cross-attention; one causal decoder stack.
-3. **[[Phase 2 - LLaMA-class decoder]]** — modernise the internals: [[Pre-LN]], [[RMSNorm]], [[RoPE]], [[SwiGLU]], [[FlashAttention]].
-4. **[[Phase 3 - Code pretraining and SFT]]** — scale up on real code data, then [[Supervised fine-tuning]] on reasoning traces.
+3. **[[Phase 2 - LLaMA-class modernized decoder]]** — modernise the internals: [[Pre-LN]], [[RMSNorm]], [[RoPE]], [[SwiGLU]], [[FlashAttention]].
+4. **[[Phase 3 - Production-scale code pretraining and SFT]]** — scale up on real code data, then [[Supervised fine-tuning]] on reasoning traces.
 5. **[[Phase 4 - GRPO reinforcement learning]]** — optimise against a verifiable reward (does the code pass tests?).
 6. **[[Phase 5 - Evaluation]]** — measure functional correctness with [[pass@k]].
 

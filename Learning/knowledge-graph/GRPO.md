@@ -15,6 +15,10 @@ In the standard outcome-supervision case, every token in `o_i` gets the same adv
 `J_GRPO(theta) = E[ (1/G) sum_i (1/|o_i|) sum_t { min( rho * A_i,  clip(rho, 1-eps, 1+eps) * A_i ) - beta * D_KL(pi_theta || pi_ref) } ]`
 with token ratio `rho = pi_theta(o_{i,t}) / pi_theta_old(o_{i,t})`.
 
+**KL placement.** Unlike RLHF-PPO, which usually folds the KL penalty *into the reward signal*, GRPO
+adds the KL term **directly to the loss** as a separate term (via the unbiased k3 estimator), which is
+why it sits *inside* the per-token average in the objective above.
+
 **Why memory-efficient (crucial for 8 GB).** PPO keeps **three** model copies (policy + reference +
 value); GRPO keeps **two** (policy + reference), since the group-mean baseline replaces the value
 network. This is *the* reason saLLMan can attempt RL on a 3060 Ti ([[Memory budget]]).

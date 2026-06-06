@@ -14,7 +14,7 @@ Attention(Q, K, V) = softmax(QKᵀ / √d_k) V
 If query/key components are independent with mean 0 and variance 1, the dot product has variance d_k. Per Vaswani §3.2.1, for large d_k the dot products grow large in magnitude, pushing softmax into regions with extremely small gradients. Dividing by √d_k counteracts this.
 
 ## Connects to
-[[Multi-head attention]] · [[FlashAttention]] (the IO-aware exact implementation) · [[Causal masking]] (how future tokens get −∞ before softmax)
+[[Multi-head attention]] · [[FlashAttention]] (the IO-aware exact implementation) · [[Causal and padding masking]] (how future tokens get −∞ before softmax)
 
 ## Reference
 Vaswani et al. 2017 — [arXiv:1706.03762](https://arxiv.org/abs/1706.03762).

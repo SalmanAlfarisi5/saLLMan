@@ -7,7 +7,7 @@ test cases, and use pass/fail as a *verifiable* reward to push the SFT policy to
 the DeepSeek-R1 recipe via [[GRPO]].
 
 ## Concepts
-[[RLHF]] | [[PPO]] | [[Reward model vs RLVR]] | [[GRPO]] | [[DeepSeek-R1 with GRPO]] | [[Code-execution reward]] | [[KL regularization]] | [[Advantage estimation]] | [[Reward hacking]] | [[On-policy vs off-policy]] | [[GRPO in practice]]
+[[RLHF]] | [[PPO]] | [[Reward model vs RLVR]] | [[GRPO]] | [[DeepSeek-R1 with GRPO]] | [[Code-execution reward]] | [[KL regularization]] | [[Advantage estimation]] | [[Reward hacking]] | [[On-policy vs off-policy]] | [[GRPO in practice]] | [[GRPO log-prob bookkeeping]]
 
 ## Why it matters for saLLMan
 [[GRPO]] is chosen specifically because it drops PPO's value network - the single biggest VRAM

@@ -3,8 +3,11 @@
 **Cluster:** [[Phase 5 - Evaluation]]
 
 **Intuition.** The probability that *at least one* of `k` sampled solutions is correct. The naive
-estimator `1 - (1 - c/n)^k` has high variance; instead sample `n >= k` solutions, count `c` correct,
-and use the **unbiased combinatorial estimator**.
+plug-in estimator `1 - (1 - c/n)^k` is **biased downward** (it *underestimates* pass@k): `1 - (1 - x)^k`
+is concave in `x`, so by Jensen's inequality its expectation falls below the true value. Instead sample
+`n >= k` solutions, count `c` correct, and use the **combinatorial estimator** below, which is both
+**unbiased** and **lower-variance**. Worked example `n=2, k=2, p=0.5`: true `0.750`, plug-in `0.625`
+(biased low), combinatorial `0.750` (exact).
 
 **Formula.** `pass@k = E_problems[ 1 - C(n-c, k) / C(n, k) ]`.
 Numerically: if `n - c < k` return 1.0; else use the product form to avoid overflow.

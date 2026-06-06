@@ -9,7 +9,7 @@ Instead of one-hot targets, use a softened distribution: mass (1 − ε) on the 
 Minimise KL divergence to the smoothed target distribution. Vaswani used ε = 0.1.
 
 ## Connects to
-[[BLEU and perplexity]] · contrast with [[Phase 3 - Code pretraining and SFT]], which uses plain cross-entropy (label smoothing is less helpful at scale).
+[[BLEU perplexity and decoding]] · contrast with [[Phase 3 - Production-scale code pretraining and SFT]], which uses plain cross-entropy (label smoothing is less helpful at scale).
 
 ## Reference
 Vaswani et al. 2017 §5.4 — [arXiv:1706.03762](https://arxiv.org/abs/1706.03762).
