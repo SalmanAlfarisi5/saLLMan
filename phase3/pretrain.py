@@ -116,11 +116,11 @@ class TrainConfig:
     dropout: float = 0.0
     rope_base: float = 10000.0
     norm_eps: float = 1e-5
-    gradient_checkpointing: bool = False   
+    gradient_checkpointing: bool = False   # off — micro_batch=4 fits at 2048 without it on the 3060 Ti
     # ── Training ─────────────────────────────────────────────────────────────
     block_size: int = 2048
-    micro_batch_size: int = 2   
-    grad_accum_steps: int = 32  
+    micro_batch_size: int = 2
+    grad_accum_steps: int = 32   # effective batch = micro · accum = 64
     total_steps: int = 60_000    
     eval_interval: int = 500
     eval_iters: int = 100        # number of val batches per eval
