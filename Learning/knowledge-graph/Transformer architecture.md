@@ -16,3 +16,5 @@ each wrapped in a residual add + [[LayerNorm]] (the [[Residual stream]]).
 - "Attention Is All You Need," Vaswani et al., 2017 - arXiv:1706.03762 (NeurIPS 2017).
 
 **Connects to:** [[Scaled dot-product attention]] | [[Multi-head attention]] | [[Position-wise feed-forward network]] | [[Encoder vs decoder cross-attention]] | [[Residual stream]]
+
+Status: Done

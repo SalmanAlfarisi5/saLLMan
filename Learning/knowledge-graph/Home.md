@@ -1,4 +1,4 @@
-# saLLMan — Knowledge Graph Home
+# saLLMan - Knowledge Graph Home
 
 Entry point for studying the saLLMan project: a from-scratch PyTorch transformer
 progression (Phase 0 -> Phase 5) ending in **saLLMan**, a decoder-only LLM for DSA
@@ -31,8 +31,12 @@ Follow the links to walk the graph. Start with [[Architecture progression]] for 
 ## Phase 3 - Production-scale code pretraining + SFT
 [[Gradient checkpointing]] | [[Chinchilla scaling laws]] | [[The Stack dataset]] | [[Memory-mapped data loading]] | [[Gradient accumulation]] | [[Overfitting and train-val divergence]] | [[Supervised fine-tuning]] | [[Masked loss]] | [[Chain-of-thought]] | [[codeforces-cots]] | [[DeepSeek-R1]] | [[Code LLMs]] | [[TF32 and fused AdamW]] | [[Dynamic padding]]
 
+**Process lessons (from the saLLMan Phase 3 run):** [[Schema verification before coding]] | [[Context length from data]] | [[Loss-mask invariants]]
+
 ## Phase 4 - GRPO reinforcement learning *(not yet implemented - deep notes)*
 [[RLHF]] | [[PPO]] | [[Reward model vs RLVR]] | [[GRPO]] | [[DeepSeek-R1 with GRPO]] | [[Code-execution reward]] | [[KL regularization]] | [[Advantage estimation]] | [[Reward hacking]] | [[On-policy vs off-policy]] | [[GRPO in practice]] | [[GRPO log-prob bookkeeping]]
 
 ## Phase 5 - Evaluation *(not yet implemented - deep notes)*
 [[pass@k]] | [[HumanEval]] | [[MBPP]] | [[LeetCode-style evaluation]] | [[Functional correctness]] | [[Test-case-based evaluation]] | [[Decontamination]] | [[Temperature sampling]] | [[Greedy vs sampling]]
+
+Status: Done

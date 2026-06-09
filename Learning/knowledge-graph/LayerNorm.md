@@ -15,3 +15,5 @@ Placement on the [[Residual stream]] defines [[Post-LN]] vs [[Pre-LN]]. The chea
 
 ## Reference
 "Layer Normalization," Ba, Kiros & Hinton, 2016 — [arXiv:1607.06450](https://arxiv.org/abs/1607.06450).
+
+Status: Done

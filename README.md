@@ -330,12 +330,29 @@ Phase 3 v1 (46.7M params, 22M-token smol corpus, 20k steps): finished
 with train loss 0.29 / val loss 4.16 — clearly overfit, exactly what
 motivated the v2 redo.
 
-Phase 3 v2 — final config (97M params, 2048 context, 2.20 B-token
-Stack-dedup Python corpus, 60 k steps ≈ 7.87 B tokens seen ≈ ~3.6
-epochs): pretraining from scratch with gradient checkpointing on. SFT
-corpus (`finetune_data_v2/`) is prepped and verified: 3 519 train / 185
-val examples from `open-r1/codeforces-cots:solutions_py_decontaminated`,
-ready to run after pretrain finishes.
+**Phase 3 v2 — pretraining (final).** 97M params, 2048 context, 2.20 B
+train tokens, 60 000 steps (~7.87 B tokens seen, ~3.6 epochs). Final:
+
+| Step | Train loss | Val loss |
+|-----:|-----------:|---------:|
+| 60 000 | **1.13** | **1.15** |
+
+Train↔val gap of ~0.02 nats throughout — Chinchilla-class training paid
+off; no overfitting. Throughput ~22.5 k tok/s on the 3060 Ti.
+
+**Phase 3 v2 — supervised fine-tune (final).** 3 519 train / 185 val
+examples from `open-r1/codeforces-cots:solutions_py_decontaminated`,
+2 epochs, effective batch 64, masked cross-entropy. Final:
+
+| Step | Train loss | Val loss |
+|-----:|-----------:|---------:|
+| 220 (end of epoch 2) | **1.32** | **1.38** |
+
+Healthy 0.05-nat gap; loss dropped sharply in the first ~40 steps
+(model adapting to the tag scaffolding) then plateaued.
+[phase3/test_sft_generation.py](phase3/test_sft_generation.py) confirms
+the model produces structured `<problem>...<reasoning>...<code>...</code>`
+output and stops cleanly at `<eos>` on held-out DSA problems.
 
 ---
 
@@ -343,7 +360,8 @@ ready to run after pretrain finishes.
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| 3 (fine-tune) | SFT on `open-r1/codeforces-cots:solutions_py_decontaminated`, editorial-as-reasoning (3 519 train / 185 val examples at 2048 context) | data prep done; awaiting pretrain completion |
+| 3 (pretrain) | 97M-param decoder-only LM at 2048 context on `the-stack-dedup` Python | **done** (val_loss 1.15 at step 60 000) |
+| 3 (fine-tune) | SFT on `open-r1/codeforces-cots:solutions_py_decontaminated`, editorial-as-reasoning (3 519 train / 185 val examples at 2048 context) | **done** (val_loss 1.38 at end of epoch 2; structural smoke test via [phase3/test_sft_generation.py](phase3/test_sft_generation.py)) |
 | 4 (RL) | GRPO with code-execution test-case reward, using `public_tests`/`private_tests` from the same FT source (DeepSeek-R1 recipe) | not started |
 | 5 (eval) | pass@1 / pass@k on held-out LeetCode (`greengerong/leetcode`) + HumanEval | not started |
 
@@ -385,6 +403,11 @@ writing the loader**, not by debugging silent garbage afterward.
    run was discarded; the [pretrain.py](phase3/pretrain.py) `--force`
    guard protects against accidentally clobbering prior checkpoints
    during the redo.
+
+Generalised versions of these process lessons live in the knowledge
+graph: [Schema verification before coding](Learning/knowledge-graph/Schema%20verification%20before%20coding.md),
+[Context length from data](Learning/knowledge-graph/Context%20length%20from%20data.md),
+[Loss-mask invariants](Learning/knowledge-graph/Loss-mask%20invariants.md).
 
 ---
 

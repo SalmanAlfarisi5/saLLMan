@@ -13,3 +13,5 @@ non-future AND non-pad.
 causality to [[FlashAttention]] via `is_causal=True` and never materializes the mask tensor.
 
 **Connects to:** [[Teacher forcing]] | [[Next-token prediction]] | [[Dynamic padding]] | [[FlashAttention]]
+
+Status: Done

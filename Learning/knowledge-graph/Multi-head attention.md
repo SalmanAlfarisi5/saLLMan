@@ -13,3 +13,5 @@ Project Q, K, V into h subspaces of dimension `d_k = d_model / h`, run [[Scaled 
 
 ## Reference
 Vaswani et al. 2017 — [arXiv:1706.03762](https://arxiv.org/abs/1706.03762).
+
+Status: Done

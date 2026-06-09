@@ -14,3 +14,5 @@ scaling** because [[RoPE]] doesn't perturb the embedding stream.
 - Vaswani et al., 2017, 3.4 - arXiv:1706.03762.
 
 **Connects to:** [[Sinusoidal positional encoding]] | [[RoPE]] | [[Tokenization thread]]
+
+Status: Done

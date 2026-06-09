@@ -17,3 +17,5 @@ Superseded in [[Phase 2 - LLaMA-class modernized decoder]] by [[RoPE]], which en
 
 ## Reference
 Vaswani et al. 2017 — [arXiv:1706.03762](https://arxiv.org/abs/1706.03762).
+
+Status: Done

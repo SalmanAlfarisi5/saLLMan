@@ -3,7 +3,7 @@
 **Cluster:** cross-cutting hub · part of [[Home]]
 
 ## Intuition
-The single objective underneath every phase. Model the joint probability of a sequence autoregressively — each token predicted from everything before it:
+The single objective underneath every phase. Model the joint probability of a sequence in an auto regressive way, each token predicted from everything before it:
 
 ```
 p(x) = Π_t  p(x_t | x_<t)
@@ -18,3 +18,5 @@ Trained by cross-entropy on the sequence shifted by one position. This never cha
 
 ## Connects to
 [[Teacher forcing]] · [[Causal and padding masking]] · [[Decoder-only GPT architecture]] · [[Masked loss]] · [[Architecture progression]]
+
+Status: Done

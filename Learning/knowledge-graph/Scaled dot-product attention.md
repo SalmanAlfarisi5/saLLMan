@@ -18,3 +18,5 @@ If query/key components are independent with mean 0 and variance 1, the dot prod
 
 ## Reference
 Vaswani et al. 2017 — [arXiv:1706.03762](https://arxiv.org/abs/1706.03762).
+
+Status: Done

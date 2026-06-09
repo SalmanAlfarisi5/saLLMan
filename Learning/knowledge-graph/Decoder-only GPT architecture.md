@@ -16,3 +16,5 @@ sequence, single mask.
 - GPT-3 "Language Models are Few-Shot Learners," Brown et al., 2020 - arXiv:2005.14165.
 
 **Connects to:** [[Next-token prediction]] | [[Encoder vs decoder cross-attention]] | [[Causal and padding masking]] | [[LLaMA architecture]]
+
+Status: Done

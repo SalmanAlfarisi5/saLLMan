@@ -16,4 +16,5 @@ Xiong et al. showed (mean-field analysis) that at initialization Post-LN has lar
 [[Pre-LN]] (the fix) · [[Noam scheduler]] · [[Residual stream]]
 
 ## Reference
-"On Layer Normalization in the Transformer Architecture," Xiong et al., 2020 — [arXiv:2002.04745](https://arxiv.org/abs/2002.04745).
+"On Layer Normalization in the Transformer Architecture," Xiong et al., 2020 — [arXiv:2002.04745](https://arxiv.org/abs/2002.04745)
+Status: Done
