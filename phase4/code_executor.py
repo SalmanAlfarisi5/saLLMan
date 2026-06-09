@@ -98,17 +98,30 @@ def _set_limits() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Output normalisation
+# Output canonicalisation — line-by-line, CodeForces-style
 # ---------------------------------------------------------------------------
-def _normalise(s: str) -> str:
-    """Strip + canonicalise line endings.
+def _to_canonical_lines(s: str) -> list[str]:
+    """Turn a (possibly noisy) output blob into a comparable list of lines.
 
-    Competitive-programming judges typically ignore trailing whitespace and
-    line-ending style. We do the same: strip outer whitespace and convert
-    CRLF / CR to LF so a model's `print()` on Windows-style data still
-    matches a Linux-staged expected output.
+    Three normalisations, in order:
+      1. CRLF / CR → LF, so Windows-vs-Linux line endings never matter.
+      2. Split on '\\n' and rstrip each line — this is the load-bearing one.
+         CodeForces test files frequently contain trailing whitespace before
+         a newline (we observed "3 3 3 \\n" in private_tests). A whole-blob
+         .strip() only handled this if the line was the LAST line; an
+         interior trailing-space line would have mismatched. Per-line
+         rstrip handles every line uniformly.
+      3. Drop trailing empty lines from both sides. A solution that ends
+         its output with print() vs print(... end='') shouldn't change the
+         verdict; competitive-programming judges treat them identically.
+
+    The unit asserts in __main__ exercise each of these.
     """
-    return s.replace("\r\n", "\n").replace("\r", "\n").strip()
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in s.split("\n")]
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +168,7 @@ def run_solution(
         if proc.returncode != 0:
             return False
 
-        return _normalise(proc.stdout) == _normalise(expected_output)
+        return _to_canonical_lines(proc.stdout) == _to_canonical_lines(expected_output)
 
 
 # ---------------------------------------------------------------------------
@@ -308,5 +321,42 @@ def _smoke_test(n_rows: int = 5) -> None:
         print(f"\n  All {n_pass_full} references scored ≈1.0 — runner confirmed.")
 
 
+def _assert_comparison_invariants() -> None:
+    """Unit asserts proving the line-by-line comparison handles the cases
+    that motivated the change. Runs before the dataset smoke test so a
+    runner regression trips here instead of silently passing rows."""
+    def eq(a, b):
+        return _to_canonical_lines(a) == _to_canonical_lines(b)
+
+    # Trailing whitespace before newline — the CodeForces case we hit.
+    assert eq("3 3 3 \n",      "3 3 3\n"),       "trailing space before \\n must match"
+    assert eq("1 2 3 \n",      "1 2 3\n"),       "single-line trailing space must match"
+
+    # Presence vs absence of the final newline is irrelevant.
+    assert eq("hello\n",       "hello"),         "trailing \\n optional"
+    assert eq("hello",         "hello\n\n\n"),   "extra trailing blanks ignored"
+
+    # Multi-line outputs with trailing whitespace on INTERIOR lines —
+    # the case that .strip() alone could not handle.
+    assert eq("1 2 \n3 4\n",   "1 2\n3 4"),      "interior-line trailing space must match"
+    assert eq("a\nb \nc\n",    "a\nb\nc"),       "interior-line trailing space (3 lines)"
+
+    # CRLF / CR normalisation.
+    assert eq("a\r\nb\r\n",    "a\nb\n"),        "CRLF must match LF"
+    assert eq("a\rb",          "a\nb"),          "CR must match LF"
+
+    # Genuine value differences must still fail.
+    assert not eq("1 2 3",     "1 2 4"),         "value diff must fail"
+    assert not eq("1\n2\n3",   "1\n2"),          "missing line must fail"
+    assert not eq("1\n2\n3",   "1\n2\n3\n4"),    "extra non-blank line must fail"
+
+    print("  comparison invariants: 10/10 asserts passed")
+
+
 if __name__ == "__main__":
+    print("=" * 64)
+    print("RUNNER COMPARISON INVARIANTS")
+    print("=" * 64)
+    _assert_comparison_invariants()
+    print()
     _smoke_test(n_rows=5)
