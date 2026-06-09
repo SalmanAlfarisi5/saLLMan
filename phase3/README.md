@@ -55,6 +55,7 @@ satisfied for the first time.
 | [finetune_data_prep.py](finetune_data_prep.py) | Build the SFT corpus from `open-r1/codeforces-cots:solutions_py_decontaminated`. Uses the dataset's `editorial` field as reasoning (NOT the R1 `<think>` traces — 15k-token median) and a trimmed `description + input_format + output_format` as the problem. Emits `train.jsonl` / `val.jsonl` with `input_ids` + `loss_mask`. |
 | [finetune.py](finetune.py) | Load the pretrained checkpoint, run masked-loss SFT with dynamic-padded batches at 2048 context, save best/last. |
 | [verify_finetune_data.py](verify_finetune_data.py) | Standalone (no torch, no GPU). Asserts `len(input_ids)==len(loss_mask)` and "single 0→1 mask flip" over every record; prints decoded previews of the first N records so the prompt/response boundary can be eyeballed. |
+| [test_sft_generation.py](test_sft_generation.py) | Loads `checkpoints_finetune_v2/best.pt`, generates completions on 4 held-out DSA problems with the same prompt prefix used during SFT. Pure inference — eyeball whether the model emits the `<reasoning>...<code>...</code><eos>` structure cleanly. |
 | `finetune_data_v2/` | SFT data outputs: `train.jsonl`, `val.jsonl`, `meta.json` (incl. full extractor skip-stats). |
 | `checkpoints_finetune_v2/` | SFT model checkpoints + `log.jsonl`. |
 
@@ -725,6 +726,59 @@ Checkpoints → `checkpoints_finetune_v2/{last,best}.pt`. Training log →
   `finetune_data_prep` *inside* the function (deferred), so changing
   tag strings only requires re-running `finetune_data_prep.py` to
   regenerate the data — no edit to `finetune.py` needed.
+
+---
+
+## Results (Phase 3 v2 — final)
+
+### Pretrain
+
+97 M params, 2048 context, 2.20 B train tokens. Cosine LR 3e-4 → 3e-5,
+warmup 2 000, total 60 000 steps. Throughput steady at ~22.5 k tok/s on
+the RTX 3060 Ti.
+
+| Step | Train loss | Val loss |
+|-----:|-----------:|---------:|
+| 1 000 | 4.32 | 4.17 |
+| 20 000 | 1.63 | 1.65 |
+| 40 000 | 1.32 | 1.34 |
+| 60 000 (final) | **1.13** | **1.15** |
+
+Train/val tracked within ~0.02 nats throughout — no overfitting (the v1
+failure mode). Chinchilla-class data budget delivered.
+
+### Fine-tune
+
+3 519 train / 185 val examples, 2 epochs, effective batch 32, masked
+cross-entropy on response tokens only. Cosine LR 2e-5 → 2e-6 with 3 %
+warmup. Total: 220 optimiser steps.
+
+| Step | Train loss | Val loss |
+|-----:|-----------:|---------:|
+| 20 | 2.51 | 2.47 |
+| 100 | 1.49 | 1.52 |
+| 200 | 1.33 | 1.38 |
+| 220 (final) | **1.32** | **1.38** |
+
+Loss dropped sharply in the first ~40 steps (model adapting to the tag
+scaffolding), then plateaued. Final ~0.05-nat train/val gap.
+
+### Generation smoke test
+
+After SFT, [test_sft_generation.py](test_sft_generation.py) runs four
+held-out DSA prompts ("reverse a linked list", "longest palindromic
+substring", "merge two sorted arrays", "two-sum") with `temperature=0.7,
+top_k=40, max_new_tokens=400`. What worked:
+
+- **Tag scaffolding**: the model emits `<reasoning>...</reasoning>\n<code>\n...\n</code>` reliably across all four prompts.
+- **Clean EOS stop**: generations terminate at `<eos>` rather than running to `max_new_tokens` in 3 of 4 cases.
+- **Editorial-style prose**: reasoning section is short, paragraph-style — matches the training distribution.
+
+What didn't:
+
+- **Code correctness is hit-or-miss** — at 97 M params / 2 epochs / 3 519
+  examples, this is expected. Bridging structural fluency to functional
+  correctness is exactly Phase 4's job.
 
 ---
 
