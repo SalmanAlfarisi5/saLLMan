@@ -52,19 +52,22 @@ from grpo import _load_curriculum, _filter_and_split_curriculum  # noqa: E402
 
 
 PRE_CKPT  = "../phase3/checkpoints_finetune_v2/best.pt"
-POST_CKPT = "checkpoints_grpo_v1/best.pt"
+POST_CKPT = "checkpoints_grpo_v2/best.pt"          # v2 = anti-hack reward
 META      = "../phase3/finetune_data_v2/meta.json"
-CURRICULUM = "curriculum.jsonl"
+CURRICULUM = "curriculum_v2.jsonl"                  # v2 curriculum
 
-# Must match the calibration/extension run so the held-out split is identical.
-POOL_STD_THRESHOLD = 0.04
-HOLDOUT_SIZE       = 15
+# Must match the v2 calibration so the held-out split is identical:
+#   grpo.py --calibration --holdout-size 5 --pool-std-threshold 0.0
+POOL_STD_THRESHOLD = 0.0
+HOLDOUT_SIZE       = 5
 SPLIT_SEED         = 42
 
 
 def _gen_and_score(model, tokenizer, problem_row, G, device,
                    temperature, top_k, max_new_tokens, per_problem_seed):
-    """Seed the RNG, then generate+score G completions via generate_group.
+    """Seed the RNG, then generate+score G completions via generate_group
+    in ADVANTAGE mode — so each completion carries raw pass fraction,
+    advantage (anti-hack reward), and the constant-output guard flag.
 
     Seeding immediately before the call makes PRE and POST share the same
     sampling trajectory for this problem.
@@ -77,31 +80,46 @@ def _gen_and_score(model, tokenizer, problem_row, G, device,
         G=G, temperature=temperature, top_k=top_k,
         max_new_tokens=max_new_tokens, device=device,
         test_timeout_s=5.0,
+        reward_mode="advantage",
     )
 
 
-def _print_block(label: str, group: list[dict]) -> tuple[float, float]:
-    """Print the G completions in a group; return (mean_reward, best_reward)."""
-    rewards = [c["reward"] for c in group]
-    print(f"\n  ┌─ {label}  (mean={statistics.fmean(rewards):.3f}, "
-          f"best={max(rewards):.3f}) " + "─" * 20)
+def _print_block(label: str, group: list[dict]) -> dict:
+    """Print the G completions; return summary {adv_mean, adv_best,
+    frac_mean, frac_best, guard_count}.
+
+    Each completion shows raw pass fraction, advantage, and whether the
+    constant-output guard fired — so a constant hack is visible as
+    'frac=0.40 adv=0.00 GUARD'.
+    """
+    advs   = [c["reward"] for c in group]              # advantage (reward_mode=advantage)
+    fracs  = [c.get("reward_fraction", 0.0) for c in group]
+    guards = [c.get("guard_fired", False) for c in group]
+    print(f"\n  ┌─ {label}  (adv mean={statistics.fmean(advs):.3f} best={max(advs):.3f} | "
+          f"raw_frac mean={statistics.fmean(fracs):.3f} best={max(fracs):.3f} | "
+          f"guard fired {sum(guards)}/{len(group)}) " + "─" * 6)
     for j, c in enumerate(group, start=1):
         code = c["code"]
         has_code = bool(code)
+        flag = "  ⚠ GUARD(constant-output)" if c.get("guard_fired") else ""
         print(f"  │")
         print(f"  │ [{label} completion {j}/{len(group)}]  "
-              f"reward={c['reward']:.3f}  "
+              f"frac={c.get('reward_fraction', 0.0):.3f} adv={c['reward']:.3f}{flag}  "
               f"{'(no <code> block parsed)' if not has_code else f'({len(code.splitlines())} lines)'}")
         if has_code:
             for line in code.splitlines():
                 print(f"  │    {line}")
         else:
-            # Show the raw completion head so we can see WHAT it produced
-            # instead of code (repetition? prose? truncation?).
             raw = c["completion_text"][:300].replace("\n", "\n  │    ")
             print(f"  │    <raw completion head>: {raw}")
     print(f"  └" + "─" * 50)
-    return statistics.fmean(rewards), max(rewards)
+    return {
+        "adv_mean":    statistics.fmean(advs),
+        "adv_best":    max(advs),
+        "frac_mean":   statistics.fmean(fracs),
+        "frac_best":   max(fracs),
+        "guard_count": sum(guards),
+    }
 
 
 def main() -> None:
@@ -112,6 +130,14 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--pre",  type=str, default=PRE_CKPT,
+                        help="Pre-GRPO checkpoint (default: SFT best.pt).")
+    parser.add_argument("--post", type=str, default=POST_CKPT,
+                        help="Post-GRPO checkpoint (default: grpo_v2/best.pt).")
+    parser.add_argument("--curriculum", type=str, default=CURRICULUM,
+                        help="Curriculum JSONL for the held-out split.")
+    parser.add_argument("--holdout-size", type=int, default=HOLDOUT_SIZE)
+    parser.add_argument("--pool-std-threshold", type=float, default=POOL_STD_THRESHOLD)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,9 +152,9 @@ def main() -> None:
     tokenizer = Tokenizer.from_file(str(tok_path))
 
     # ── Held-out split (identical to training) ──────────────────────────────
-    curriculum = _load_curriculum((_HERE / CURRICULUM).resolve(), solvable_only=True)
+    curriculum = _load_curriculum((_HERE / args.curriculum).resolve(), solvable_only=True)
     _training, holdout = _filter_and_split_curriculum(
-        curriculum, POOL_STD_THRESHOLD, HOLDOUT_SIZE, SPLIT_SEED,
+        curriculum, args.pool_std_threshold, args.holdout_size, SPLIT_SEED,
     )
     chosen = holdout[:args.n_problems]
     print(f"Held-out problems selected (never trained on): "
@@ -142,12 +168,12 @@ def main() -> None:
                       split="train", token=hf_token)
 
     # ── Load BOTH models (two resident — same as GRPO's two-model plan) ─────
-    print(f"\nLoading PRE-GRPO  (SFT):  {PRE_CKPT}")
-    pre_model, _  = load_pretrained((_HERE / PRE_CKPT).resolve(),
+    print(f"\nLoading PRE-GRPO  (SFT):  {args.pre}")
+    pre_model, _  = load_pretrained((_HERE / args.pre).resolve(),
                                     gradient_checkpointing=False, device=device)
     pre_model.eval()
-    print(f"Loading POST-GRPO (step 1150): {POST_CKPT}")
-    post_model, _ = load_pretrained((_HERE / POST_CKPT).resolve(),
+    print(f"Loading POST-GRPO:        {args.post}")
+    post_model, _ = load_pretrained((_HERE / args.post).resolve(),
                                     gradient_checkpointing=False, device=device)
     post_model.eval()
 
@@ -176,39 +202,42 @@ def main() -> None:
         pre_group  = _gen_and_score(pre_model, tokenizer, problem_row, args.G,
                                     device, args.temperature, args.top_k,
                                     args.max_new_tokens, pseed)
-        pre_mean, pre_best = _print_block("PRE ", pre_group)
+        pre_s = _print_block("PRE ", pre_group)
 
         post_group = _gen_and_score(post_model, tokenizer, problem_row, args.G,
                                     device, args.temperature, args.top_k,
                                     args.max_new_tokens, pseed)
-        post_mean, post_best = _print_block("POST", post_group)
+        post_s = _print_block("POST", post_group)
 
-        table_rows.append({
-            "row": row_idx, "title": title,
-            "pre_mean": pre_mean, "post_mean": post_mean,
-            "pre_best": pre_best, "post_best": post_best,
-        })
+        table_rows.append({"row": row_idx, "title": title,
+                           "pre": pre_s, "post": post_s})
 
     # ── Summary table ───────────────────────────────────────────────────────
-    print("\n" + "=" * 72)
-    print("SUMMARY")
-    print("=" * 72)
-    hdr = f"{'problem':<34} {'pre_mean':>8} {'post_mean':>9} {'pre_best':>8} {'post_best':>9}"
+    # Two metrics side by side:
+    #   adv  = anti-hack reward (max(0, frac - constant_baseline), guard-zeroed)
+    #   frac = raw pass fraction (what the OLD reward used — inflated by constants)
+    #   guard = # of completions (out of G) that were constant-output hacks
+    print("\n" + "=" * 78)
+    print("SUMMARY  (adv = anti-hack reward, frac = raw pass rate, gG = guard fires/run)")
+    print("=" * 78)
+    hdr = (f"{'problem':<26} {'pre_adv':>7} {'post_adv':>8} "
+           f"{'pre_frac':>8} {'post_frac':>9} {'pre_gG':>6} {'post_gG':>7}")
     print(hdr)
     print("-" * len(hdr))
+    G = args.G
     for r in table_rows:
-        name = (r["title"][:32]) if r["title"] else f"row {r['row']}"
-        print(f"{name:<34} {r['pre_mean']:>8.3f} {r['post_mean']:>9.3f} "
-              f"{r['pre_best']:>8.3f} {r['post_best']:>9.3f}")
+        name = (r["title"][:24]) if r["title"] else f"row {r['row']}"
+        print(f"{name:<26} {r['pre']['adv_mean']:>7.3f} {r['post']['adv_mean']:>8.3f} "
+              f"{r['pre']['frac_mean']:>8.3f} {r['post']['frac_mean']:>9.3f} "
+              f"{r['pre']['guard_count']:>4}/{G} {r['post']['guard_count']:>5}/{G}")
     print("-" * len(hdr))
-    overall = {
-        "pre_mean":  statistics.fmean(r["pre_mean"]  for r in table_rows),
-        "post_mean": statistics.fmean(r["post_mean"] for r in table_rows),
-        "pre_best":  statistics.fmean(r["pre_best"]  for r in table_rows),
-        "post_best": statistics.fmean(r["post_best"] for r in table_rows),
-    }
-    print(f"{'OVERALL':<34} {overall['pre_mean']:>8.3f} {overall['post_mean']:>9.3f} "
-          f"{overall['pre_best']:>8.3f} {overall['post_best']:>9.3f}")
+    o = lambda side, key: statistics.fmean(r[side][key] for r in table_rows)
+    tot_pre_g  = sum(r["pre"]["guard_count"]  for r in table_rows)
+    tot_post_g = sum(r["post"]["guard_count"] for r in table_rows)
+    denom = G * len(table_rows)
+    print(f"{'OVERALL':<26} {o('pre','adv_mean'):>7.3f} {o('post','adv_mean'):>8.3f} "
+          f"{o('pre','frac_mean'):>8.3f} {o('post','frac_mean'):>9.3f} "
+          f"{tot_pre_g:>3}/{denom} {tot_post_g:>4}/{denom}")
 
 
 if __name__ == "__main__":
