@@ -78,7 +78,7 @@ from finetune_data_prep import (                              # noqa: E402
     PROBLEM_OPEN, PROBLEM_CLOSE, REASON_OPEN,
     BOS_IDX, EOS_IDX,
 )
-from code_executor import reward_fraction                     # noqa: E402
+from code_executor import reward_fraction, reward_advantage_detailed  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +170,21 @@ def generate_group(
     max_new_tokens: int = 512,
     device: torch.device | None = None,
     test_timeout_s: float = 5.0,
+    reward_mode: str = "fraction",
 ) -> list[dict]:
     """Sample G independent completions for one problem; score each.
 
-    Sequential — G separate calls to `model.generate`. Each call uses
-    KV-cache internally (see GPTv3.generate). This is the right shape for
-    the smoke test; the eventual GRPO loop will want a batched-generate
-    path for efficiency.
+    reward_mode:
+      "fraction"  — raw pass fraction (legacy; used by the early smoke tests)
+      "advantage" — max(0, fraction - constant_baseline) with the
+                    constant-output guard (the anti-hacking reward).
+
+    Each result dict always carries `reward` (the reward_mode scalar) plus
+    `reward_fraction` (the raw fraction, for visibility) so callers can log
+    both without recomputing.
+
+    Sequential — G separate calls to `model.generate`, each using the
+    internal KV-cache.
     """
     if device is None:
         device = next(model.parameters()).device
@@ -204,16 +212,26 @@ def generate_group(
         completion_text = tokenizer.decode(completion_ids)
         code = _extract_code_block(completion_text)
 
+        reward = 0.0
+        raw_fraction = 0.0
+        guard_fired = False
         if code and tests["input"]:
-            reward = reward_fraction(code, tests, timeout_s=test_timeout_s)
-        else:
-            reward = 0.0
+            if reward_mode == "advantage":
+                info = reward_advantage_detailed(code, tests, timeout_s=test_timeout_s)
+                reward       = info["advantage"]
+                raw_fraction = info["fraction"]
+                guard_fired  = info["guard_fired"]
+            else:
+                raw_fraction = reward_fraction(code, tests, timeout_s=test_timeout_s)
+                reward       = raw_fraction
 
         results.append({
             "completion_ids":  completion_ids,
             "completion_text": completion_text,
             "code":            code,
             "reward":          reward,
+            "reward_fraction": raw_fraction,
+            "guard_fired":     guard_fired,
         })
 
     return results

@@ -225,6 +225,11 @@ def main() -> None:
     parser.add_argument("--out", type=Path,
                         default=Path("curriculum.jsonl"),
                         help="JSONL output (append + resume-aware).")
+    parser.add_argument("--reward-mode", type=str, default="fraction",
+                        choices=["fraction", "advantage"],
+                        help="Scoring reward. 'advantage' = beats-constant-"
+                             "baseline reward (anti-hacking); 'fraction' = raw "
+                             "pass rate (legacy).")
     parser.add_argument("--limit", type=int, default=None,
                         help="Score at most this many NEW (unscored) problems. "
                              "Already-scored row_indices are skipped first.")
@@ -353,6 +358,7 @@ def main() -> None:
                     G=args.G, temperature=args.temperature, top_k=args.top_k,
                     max_new_tokens=args.max_new_tokens, device=device,
                     test_timeout_s=args.test_timeout_s,
+                    reward_mode=args.reward_mode,
                 )
             except Exception as e:
                 # Don't let one bad problem crash a multi-hour pass.

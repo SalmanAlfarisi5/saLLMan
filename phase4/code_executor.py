@@ -60,6 +60,7 @@ import resource
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -125,30 +126,24 @@ def _to_canonical_lines(s: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Single test case
+# Single execution — shared core
 # ---------------------------------------------------------------------------
-def run_solution(
+def _execute(
     code: str,
     test_input: str,
-    expected_output: str,
     timeout_s: float = 5.0,
-) -> bool:
-    """Execute `code` as a Python script in a subprocess.
+) -> tuple[bool, str | None]:
+    """Run `code` as a subprocess; return (clean_exit, stdout).
 
-    Returns True iff:
-      - the subprocess exits with code 0,
-      - did not hit the wall-clock timeout,
-      - did not hit any rlimit,
-      - normalised stdout equals normalised expected_output.
+    clean_exit is True iff the process exited 0 within the timeout / rlimits.
+    stdout is the captured stdout string when clean_exit, else None.
 
-    Any other outcome (exception in the child, segfault, OOM, timeout)
-    is treated as a failed test. We never raise to the caller — GRPO
-    needs a clean boolean per test so the reward computation can proceed.
+    Never raises — timeouts / fork failures / non-zero exits all return
+    (False, None). Callers (run_solution, reward_*) build verdicts on top.
     """
     with tempfile.TemporaryDirectory(prefix="saLLMan_exec_") as tmpdir:
         script_path = Path(tmpdir) / "sol.py"
         script_path.write_text(code)
-
         try:
             proc = subprocess.run(
                 [sys.executable, "-I", "-S", str(script_path)],
@@ -160,15 +155,29 @@ def run_solution(
                 preexec_fn=_set_limits,
             )
         except subprocess.TimeoutExpired:
-            return False
+            return False, None
         except (OSError, ValueError):
-            # Fork failure, executable missing, etc.
-            return False
-
+            return False, None
         if proc.returncode != 0:
-            return False
+            return False, None
+        return True, proc.stdout
 
-        return _to_canonical_lines(proc.stdout) == _to_canonical_lines(expected_output)
+
+# ---------------------------------------------------------------------------
+# Single test case
+# ---------------------------------------------------------------------------
+def run_solution(
+    code: str,
+    test_input: str,
+    expected_output: str,
+    timeout_s: float = 5.0,
+) -> bool:
+    """True iff `code` exits cleanly and its stdout matches expected_output
+    under CodeForces-style line canonicalisation."""
+    ok, stdout = _execute(code, test_input, timeout_s=timeout_s)
+    if not ok or stdout is None:
+        return False
+    return _to_canonical_lines(stdout) == _to_canonical_lines(expected_output)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +209,114 @@ def reward_fraction(
         if run_solution(code, tin, texp, timeout_s=timeout_s):
             n_pass += 1
     return n_pass / len(inputs)
+
+
+# ---------------------------------------------------------------------------
+# Constant-output baseline + advantage reward
+# ---------------------------------------------------------------------------
+# Motivation (found in the pre/post side-by-side): the policy learned to
+# print a constant (-1, 0) on problems whose test set is dominated by one
+# expected output, gaining raw pass-fraction without solving anything.
+#
+# constant_baseline(tests) = score a best-case constant-output program gets
+#   = (count of the single most common expected output) / n_tests.
+#
+# reward_advantage = max(0, fraction - baseline), with a secondary guard
+# that zeroes any completion producing identical output across ALL distinct
+# test inputs (catches constants that aren't the modal value).
+def constant_baseline(tests: dict) -> float:
+    """Fraction of tests a best-case constant-output program would pass:
+    the relative frequency of the modal expected output (canonicalised so
+    "1\\n" and "1" count as the same output class). No code execution."""
+    from collections import Counter
+    outputs = tests.get("output") or []
+    if not outputs:
+        return 0.0
+    canon = [tuple(_to_canonical_lines(o)) for o in outputs]
+    most_common_count = Counter(canon).most_common(1)[0][1]
+    return most_common_count / len(outputs)
+
+
+def reward_advantage_detailed(
+    code: str,
+    tests: dict,
+    timeout_s: float = 5.0,
+    budget_s: float | None = None,
+    guard_constant: bool = True,
+) -> dict:
+    """Run all tests once; return reward + diagnostics.
+
+    Returns dict with:
+      fraction    — raw pass fraction (n_pass / n_total), the old reward
+      baseline    — constant_baseline(tests)
+      advantage   — max(0, fraction - baseline), zeroed if guard fires
+      guard_fired — True if code produced one identical output for every
+                    distinct test input (a constant-output hack)
+      n_run       — tests actually executed (may be < n_total if budget hit)
+      n_total     — total tests available
+
+    `budget_s` caps total wall-clock; fraction is over n_total (not n_run)
+    so a budget cutoff can't inflate the score by running only easy tests.
+    """
+    info = {"fraction": 0.0, "baseline": 0.0, "advantage": 0.0,
+            "guard_fired": False, "n_run": 0, "n_total": 0}
+    if not code:
+        return info
+    inputs  = tests.get("input")  or []
+    outputs = tests.get("output") or []
+    if not inputs or len(inputs) != len(outputs):
+        return info
+
+    n_total = len(inputs)
+    info["n_total"] = n_total
+    baseline = constant_baseline(tests)
+    info["baseline"] = baseline
+
+    start = time.time()
+    n_pass = 0
+    n_run = 0
+    by_input: dict[tuple, tuple | None] = {}   # distinct canon-input -> canon-output
+    for tin, texp in zip(inputs, outputs):
+        if budget_s is not None and time.time() - start >= budget_s:
+            break
+        ok, stdout = _execute(code, tin, timeout_s=timeout_s)
+        n_run += 1
+        canon_in = tuple(_to_canonical_lines(tin))
+        if ok and stdout is not None:
+            canon_out = tuple(_to_canonical_lines(stdout))
+            by_input.setdefault(canon_in, canon_out)
+            if canon_out == tuple(_to_canonical_lines(texp)):
+                n_pass += 1
+        else:
+            by_input.setdefault(canon_in, None)
+
+    info["n_run"] = n_run
+    fraction = n_pass / n_total          # over TOTAL, not run
+    info["fraction"] = fraction
+
+    guard_fired = False
+    if guard_constant:
+        produced = {o for o in by_input.values() if o is not None}
+        if len(by_input) >= 2 and len(produced) == 1:
+            guard_fired = True
+    info["guard_fired"] = guard_fired
+
+    info["advantage"] = 0.0 if guard_fired else max(0.0, fraction - baseline)
+    return info
+
+
+def reward_advantage(
+    code: str,
+    tests: dict,
+    timeout_s: float = 5.0,
+    budget_s: float | None = None,
+) -> float:
+    """Scalar GRPO reward: max(0, pass_fraction - constant_baseline), with
+    the constant-output guard. Beating the trivial baseline is the only way
+    to score."""
+    return reward_advantage_detailed(
+        code, tests, timeout_s=timeout_s, budget_s=budget_s,
+    )["advantage"]
 
 
 # ===========================================================================
@@ -353,10 +470,62 @@ def _assert_comparison_invariants() -> None:
     print("  comparison invariants: 10/10 asserts passed")
 
 
+def _assert_reward_advantage() -> None:
+    """Unit asserts for constant_baseline + reward_advantage.
+
+    Synthetic problem: print 'YES' if n is even else 'NO'.
+      inputs  = 2,4,6,1,3
+      outputs = YES,YES,YES,NO,NO   → modal 'YES' (3/5) → baseline = 0.6
+    Three candidate programs:
+      - constant   `print("YES")`  passes 3/5=0.6, but is a constant hack
+      - partial    correct on evens + n==1, wrong on n==3  → 4/5=0.8
+      - full       correct parity                          → 5/5=1.0
+    """
+    tests = {
+        "input":  ["2", "4", "6", "1", "3"],
+        "output": ["YES", "YES", "YES", "NO", "NO"],
+    }
+
+    base = constant_baseline(tests)
+    assert abs(base - 0.6) < 1e-9, f"baseline should be 0.6, got {base}"
+
+    const_code   = 'print("YES")'
+    partial_code = 'n=int(input())\nprint("YES" if n>1 else "NO")'  # wrong only on n==3
+    full_code    = 'n=int(input())\nprint("YES" if n%2==0 else "NO")'
+
+    c = reward_advantage_detailed(const_code, tests)
+    p = reward_advantage_detailed(partial_code, tests)
+    f = reward_advantage_detailed(full_code, tests)
+
+    # 1. Constant on a dominated set scores ~0 (baseline-subtraction AND
+    #    the guard both push it to 0).
+    assert c["advantage"] <= 0.01, f"constant should net ~0, got {c['advantage']:.3f}"
+    assert c["guard_fired"], "constant-output guard should fire on print('YES')"
+
+    # 2. A genuinely-partial program scores > 0.
+    assert p["advantage"] > 0.0, f"partial should score > 0, got {p['advantage']:.3f}"
+    assert not p["guard_fired"], "partial varies output → guard must NOT fire"
+
+    # 3. A full solution scores highest.
+    assert f["advantage"] > p["advantage"], \
+        f"full ({f['advantage']:.3f}) should beat partial ({p['advantage']:.3f})"
+    assert abs(f["fraction"] - 1.0) < 1e-9, f"full should pass all, got {f['fraction']}"
+
+    print(f"  reward-advantage asserts: 6/6 passed")
+    print(f"    baseline={base:.2f}  "
+          f"const adv={c['advantage']:.2f} (guard={c['guard_fired']})  "
+          f"partial adv={p['advantage']:.2f}  full adv={f['advantage']:.2f}")
+
+
 if __name__ == "__main__":
     print("=" * 64)
     print("RUNNER COMPARISON INVARIANTS")
     print("=" * 64)
     _assert_comparison_invariants()
+    print()
+    print("=" * 64)
+    print("REWARD-ADVANTAGE INVARIANTS")
+    print("=" * 64)
+    _assert_reward_advantage()
     print()
     _smoke_test(n_rows=5)

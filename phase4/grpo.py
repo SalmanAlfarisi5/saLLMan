@@ -75,7 +75,7 @@ from finetune_data_prep import (                              # noqa: E402
     PROBLEM_OPEN, PROBLEM_CLOSE, REASON_OPEN,
     BOS_IDX, EOS_IDX,
 )
-from code_executor import run_solution                        # noqa: E402
+from code_executor import reward_advantage_detailed           # noqa: E402
 from rollouts import _pick_tests, _extract_code_block         # noqa: E402
 from build_curriculum import _subsample_tests                 # noqa: E402
 
@@ -208,30 +208,19 @@ def _per_token_logp(
 def _reward_with_budget(
     code: str, tests: dict,
     timeout_s: float, budget_s: float,
-) -> tuple[float, int]:
-    """Like reward_fraction but with a per-completion wall-clock cap.
+) -> dict:
+    """Advantage reward with a per-completion wall-clock cap.
 
-    Returns (reward, n_tests_run). Reward = n_pass / n_total — NOT
-    n_pass / n_run — so a slow completion can't game the metric by
-    running only the easy tests before the budget elapses.
+    Returns the reward_advantage_detailed dict:
+      {advantage, fraction, baseline, guard_fired, n_run, n_total}
+
+    `advantage` (the anti-hacking reward) is the GRPO scalar; `fraction`
+    (raw pass rate) is kept so the held-out eval can log both. Fraction is
+    over n_total, so a budget cutoff can't inflate either metric.
     """
-    if not code:
-        return 0.0, 0
-    inputs  = tests.get("input")  or []
-    outputs = tests.get("output") or []
-    if not inputs or len(inputs) != len(outputs):
-        return 0.0, 0
-    n_total = len(inputs)
-    n_pass  = 0
-    n_run   = 0
-    start = time.time()
-    for tin, texp in zip(inputs, outputs):
-        if time.time() - start >= budget_s:
-            break
-        if run_solution(code, tin, texp, timeout_s=timeout_s):
-            n_pass += 1
-        n_run += 1
-    return n_pass / n_total, n_run
+    return reward_advantage_detailed(
+        code, tests, timeout_s=timeout_s, budget_s=budget_s,
+    )
 
 
 def _load_curriculum(path: Path, solvable_only: bool = True) -> list[dict]:
@@ -318,12 +307,18 @@ def grpo_step(
         })
 
     # ── 4. Score each completion (CPU subprocesses) ─────────────────────────
+    # reward = advantage (beats-constant-baseline); we keep the raw fraction
+    # + guard flag for logging.
     for c in completions:
-        c["reward"], c["n_tests_run"] = _reward_with_budget(
+        info = _reward_with_budget(
             c["code"], tests,
             timeout_s=cfg.test_timeout_s,
             budget_s=cfg.completion_budget_s,
         )
+        c["reward"]          = info["advantage"]
+        c["reward_fraction"] = info["fraction"]
+        c["guard_fired"]     = info["guard_fired"]
+        c["n_tests_run"]     = info["n_run"]
 
     rewards_list = [c["reward"] for c in completions]
     r_tensor = torch.tensor(rewards_list, dtype=torch.float, device=device)
@@ -337,6 +332,8 @@ def grpo_step(
             "skipped":         True,
             "mean_reward":     r_mean,
             "std_reward":      r_std,
+            "mean_fraction":   sum(c["reward_fraction"] for c in completions) / G,
+            "guard_rate":      sum(1 for c in completions if c["guard_fired"]) / G,
             "parse_rate":      sum(1 for c in completions if c["code"]) / G,
             "pos_reward_rate": sum(1 for r in rewards_list if r > 0) / G,
             "n_tests_used":    n_tests_used,
@@ -439,6 +436,8 @@ def grpo_step(
         "skipped":           False,
         "mean_reward":       r_mean,
         "std_reward":        r_std,
+        "mean_fraction":     sum(c["reward_fraction"] for c in completions) / G,
+        "guard_rate":        sum(1 for c in completions if c["guard_fired"]) / G,
         "advantage_mag":     advantages.abs().mean().item(),
         "loss":              total_loss_logged / max(n_contributed, 1),
         "kl":                total_kl_logged / max(n_contributed, 1),
@@ -521,19 +520,21 @@ def _evaluate_holdout(
     ds,
     cfg: GRPOConfig,
     device: torch.device,
-) -> tuple[float, list[dict]]:
+) -> tuple[float, float, list[dict]]:
     """Score the current policy on the held-out set.
 
     For each held-out problem:
       - generate eval_g completions at the same temperature/top_k as training
-      - score against ALL available tests (no subsampling) with per-completion
-        wall-clock budget eval_completion_budget_s
-      - reward = (n_pass / n_total_tests)
+      - score with reward_advantage (the training reward) AND raw pass
+        fraction, against a deterministically-capped test subset.
 
-    Returns (mean across problems, per-problem stats list).
+    Returns (advantage_mean, fraction_mean, per_problem_stats).
+    advantage_mean is the headline (does the model beat the constant baseline);
+    fraction_mean is the raw pass rate alongside it.
     """
     policy.eval()
-    per_problem_means: list[float] = []
+    per_problem_adv:  list[float] = []
+    per_problem_frac: list[float] = []
     per_problem_stats: list[dict] = []
 
     for crow in holdout_rows:
@@ -559,7 +560,8 @@ def _evaluate_holdout(
         prompt_ids = _build_prompt_ids(problem_row, tokenizer)
         prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=device)
 
-        rewards: list[float] = []
+        adv_rewards:  list[float] = []
+        frac_rewards: list[float] = []
         for g in range(cfg.eval_g):
             out = policy.generate(
                 prompt_tensor.unsqueeze(0),
@@ -571,29 +573,36 @@ def _evaluate_holdout(
             completion_ids = out[0][len(prompt_ids):]
             completion_text = tokenizer.decode(completion_ids.tolist())
             code = _extract_code_block(completion_text)
-            reward, _ = _reward_with_budget(
+            info = _reward_with_budget(
                 code, tests,
                 timeout_s=cfg.test_timeout_s,
                 budget_s=cfg.eval_completion_budget_s,
             )
-            rewards.append(reward)
+            adv_rewards.append(info["advantage"])
+            frac_rewards.append(info["fraction"])
 
-        if not rewards:
+        if not adv_rewards:
             continue
-        problem_mean = statistics.fmean(rewards)
-        per_problem_means.append(problem_mean)
+        adv_mean  = statistics.fmean(adv_rewards)
+        frac_mean = statistics.fmean(frac_rewards)
+        per_problem_adv.append(adv_mean)
+        per_problem_frac.append(frac_mean)
         per_problem_stats.append({
-            "row_index":   row_idx,
-            "title":       crow.get("problem_title", "<no title>"),
-            "n_tests":     len(tests.get("input", [])),
-            "mean_reward": problem_mean,
-            "max_reward":  max(rewards),
-            "n_perfect":   sum(1 for r in rewards if r >= 0.99),
+            "row_index":     row_idx,
+            "title":         crow.get("problem_title", "<no title>"),
+            "n_tests":       len(tests.get("input", [])),
+            "adv_mean":      adv_mean,
+            "frac_mean":     frac_mean,
+            "adv_max":       max(adv_rewards),
+            "frac_max":      max(frac_rewards),
+            "n_perfect":     sum(1 for r in frac_rewards if r >= 0.99),
         })
 
-    if not per_problem_means:
-        return 0.0, []
-    return statistics.fmean(per_problem_means), per_problem_stats
+    if not per_problem_adv:
+        return 0.0, 0.0, []
+    return (statistics.fmean(per_problem_adv),
+            statistics.fmean(per_problem_frac),
+            per_problem_stats)
 
 
 # ---------------------------------------------------------------------------
@@ -783,7 +792,7 @@ def train(cfg: GRPOConfig, smoke: bool = False,
     reward_history:        list[float]                = []
     kl_history:            list[float]                = []
     loss_history:          list[float]                = []
-    holdout_history:       list[tuple[int, float]]    = []
+    holdout_history:       list[tuple[int, float, float]] = []  # (step, adv, frac)
     rho_extremes:          list[tuple[float, float]]  = []
     peak_gb_overall        = 0.0
     best_holdout_reward    = -float("inf")
@@ -800,10 +809,14 @@ def train(cfg: GRPOConfig, smoke: bool = False,
         reward_history       = list(payload.get("reward_history", []))
         kl_history           = list(payload.get("kl_history", []))
         loss_history         = list(payload.get("loss_history", []))
-        # holdout_history items are saved as lists from JSON; coerce back to tuples
-        holdout_history = [
-            (int(s), float(r)) for s, r in payload.get("holdout_history", [])
-        ]
+        # holdout_history items are (step, advantage, fraction) — saved as
+        # lists; coerce back to tuples. Tolerate 2-tuples from older runs.
+        holdout_history = []
+        for item in payload.get("holdout_history", []):
+            if len(item) >= 3:
+                holdout_history.append((int(item[0]), float(item[1]), float(item[2])))
+            else:
+                holdout_history.append((int(item[0]), float(item[1]), float("nan")))
     elif resume:
         print(f"--resume requested but {last_ckpt} not found; starting fresh.")
 
@@ -855,10 +868,10 @@ def train(cfg: GRPOConfig, smoke: bool = False,
         if step % cfg.log_interval == 0:
             print(
                 f"[step {step:3d}] row={int(crow['row_index']):5d} "
-                f"r̄={metrics['mean_reward']:.3f} σr={metrics['std_reward']:.3f} "
+                f"adv r̄={metrics['mean_reward']:.3f} σ={metrics['std_reward']:.3f} "
+                f"frac={metrics['mean_fraction']:.3f} guard={metrics['guard_rate']:.2f} "
                 f"|A|={metrics['advantage_mag']:.2f}  "
                 f"L={metrics['loss']:+.4f} KL={metrics['kl']:.4f} "
-                f"ρ∈[{metrics['rho_min']:.3f},{metrics['rho_max']:.3f}] "
                 f"|g|={metrics['grad_norm']:.2f}  "
                 f"parse={metrics['parse_rate']:.2f} pos={metrics['pos_reward_rate']:.2f}  "
                 f"GPU={peak_gb:.2f}G ({elapsed:.1f}s)"
@@ -872,33 +885,36 @@ def train(cfg: GRPOConfig, smoke: bool = False,
         # ── Calibration path: eval + best-by-holdout + full checkpoint ────
         if calibration and step % cfg.eval_interval == 0:
             print(f"\n  >> step {step}: running held-out eval over "
-                  f"{len(holdout_pool)} problems (G={cfg.eval_g}, all tests) ...")
+                  f"{len(holdout_pool)} problems (G={cfg.eval_g}, "
+                  f"≤{cfg.eval_max_tests} tests) ...")
             t_eval = time.time()
-            holdout_mean, per_problem = _evaluate_holdout(
+            holdout_mean, holdout_frac, per_problem = _evaluate_holdout(
                 policy, tokenizer, holdout_pool, ds, cfg, device,
             )
             eval_elapsed = time.time() - t_eval
             policy.train()   # _evaluate_holdout sets eval mode
 
+            # best.pt tracks the ADVANTAGE reward (the anti-hack signal).
             last_holdout_reward = holdout_mean
-            holdout_history.append((step, holdout_mean))
+            holdout_history.append((step, holdout_mean, holdout_frac))
 
-            # Compact running summary line
+            # Compact running summary line — show BOTH advantage and raw frac
             recent_n = min(cfg.eval_interval, len(reward_history))
             recent_train_r = statistics.fmean(reward_history[-recent_n:])
             recent_train_kl = statistics.fmean(kl_history[-recent_n:])
-            print(f"  >> step {step}: train r̄(last {recent_n})={recent_train_r:.3f} "
-                  f"KL(last {recent_n})={recent_train_kl:.4f}  "
-                  f"HELD-OUT r̄={holdout_mean:.3f}  "
+            print(f"  >> step {step}: train adv r̄(last {recent_n})={recent_train_r:.3f} "
+                  f"KL={recent_train_kl:.4f}  "
+                  f"HELD-OUT adv={holdout_mean:.3f}  raw_frac={holdout_frac:.3f}  "
                   f"({eval_elapsed:.0f}s, "
-                  f"{sum(p['n_perfect'] for p in per_problem)}/{cfg.eval_g*len(per_problem)} perfect rollouts)")
+                  f"{sum(p['n_perfect'] for p in per_problem)}/{cfg.eval_g*len(per_problem)} perfect)")
 
             with log_path.open("a", encoding="utf-8") as fp:
                 fp.write(json.dumps({
                     "step": step, "kind": "holdout_eval",
-                    "holdout_mean": holdout_mean,
+                    "holdout_advantage": holdout_mean,
+                    "holdout_fraction": holdout_frac,
                     "eval_elapsed_s": eval_elapsed,
-                    "recent_train_mean": recent_train_r,
+                    "recent_train_advantage": recent_train_r,
                     "per_problem": per_problem,
                 }) + "\n")
 
@@ -980,15 +996,17 @@ def train(cfg: GRPOConfig, smoke: bool = False,
 
         if calibration and holdout_history:
             print(f"\n  HELD-OUT TRAJECTORY (every {cfg.eval_interval} steps):")
-            print(f"    step | holdout r̄ | Δ from prev")
+            print(f"    step | adv r̄ | raw_frac | Δadv from prev")
             prev = None
-            for s, r in holdout_history:
-                delta = f"{r - prev:+.3f}" if prev is not None else "  --  "
-                print(f"    {s:>4} | {r:>9.3f} | {delta}")
-                prev = r
-            init_h = holdout_history[0][1]
+            for item in holdout_history:
+                s, adv = item[0], item[1]
+                frac = item[2] if len(item) >= 3 else float("nan")
+                delta = f"{adv - prev:+.3f}" if prev is not None else "  --  "
+                print(f"    {s:>4} | {adv:>6.3f} | {frac:>8.3f} | {delta}")
+                prev = adv
+            init_h  = holdout_history[0][1]
             final_h = holdout_history[-1][1]
-            print(f"    initial → final: {init_h:.3f} → {final_h:.3f}  "
+            print(f"    advantage initial → final: {init_h:.3f} → {final_h:.3f}  "
                   f"({'↑' if final_h > init_h else ('↓' if final_h < init_h else '→')})  "
                   f"best: {best_holdout_reward:.3f}")
 
@@ -1043,7 +1061,8 @@ def main() -> None:
         cfg.checkpoint_interval = 10_000   # don't bother during smoke
 
     # Calibration preset: 400 steps, eval every 25, held-out best-tracking.
-    # These are the user-spec defaults for the first real calibration run.
+    # v2: reward is now reward_advantage (anti-hacking), curriculum_v2 pool,
+    # fresh checkpoints_grpo_v2 dir. These are the re-calibration defaults.
     if args.calibration:
         cfg.total_steps         = 400
         cfg.eval_interval       = 25
@@ -1055,6 +1074,9 @@ def main() -> None:
         cfg.weight_test_cap     = 15
         cfg.max_tests           = 15       # quality > speed for calibration
         cfg.eval_g              = 8
+        cfg.eval_max_tests      = 10       # held-out scored on ≤10 tests
+        cfg.curriculum          = "curriculum_v2.jsonl"
+        cfg.out_dir             = "checkpoints_grpo_v2"
         # All other GRPO knobs (lr, kl_beta, clip_eps, G, temperature) stay
         # at smoke-test defaults so we change one thing at a time.
 
