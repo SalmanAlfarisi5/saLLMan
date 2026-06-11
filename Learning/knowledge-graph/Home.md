@@ -33,8 +33,10 @@ Follow the links to walk the graph. Start with [[Architecture progression]] for 
 
 **Process lessons (from the saLLMan Phase 3 run):** [[Schema verification before coding]] | [[Context length from data]] | [[Loss-mask invariants]]
 
-## Phase 4 - GRPO reinforcement learning *(not yet implemented - deep notes)*
+## Phase 4 - GRPO reinforcement learning *(implemented; documented negative result)*
 [[RLHF]] | [[PPO]] | [[Reward model vs RLVR]] | [[GRPO]] | [[DeepSeek-R1 with GRPO]] | [[Code-execution reward]] | [[KL regularization]] | [[Advantage estimation]] | [[Reward hacking]] | [[On-policy vs off-policy]] | [[GRPO in practice]] | [[GRPO log-prob bookkeeping]]
+
+**Process lessons (from the saLLMan Phase 4 run):** [[Reward hacking]] | [[Verifiable reward has a baseline]] | [[Read the outputs not just the metric]]
 
 ## Phase 5 - Evaluation *(not yet implemented - deep notes)*
 [[pass@k]] | [[HumanEval]] | [[MBPP]] | [[LeetCode-style evaluation]] | [[Functional correctness]] | [[Test-case-based evaluation]] | [[Decontamination]] | [[Temperature sampling]] | [[Greedy vs sampling]]

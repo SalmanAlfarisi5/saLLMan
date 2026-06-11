@@ -36,15 +36,26 @@ saLLMan/
 │   ├── README.md
 │   ├── decoder_only_v2.py        Self-contained model
 │   └── train_lm_v2.py            AdamW + cosine LR + KV-cache
-└── phase3/                       Code pretraining
-    ├── README.md
-    ├── decoder_only_v3.py        GPTv3 (Phase 2 + gradient checkpointing)
-    ├── data_prep.py              The Stack Python → train.bin / val.bin
-    ├── pretrain.py               Full pretraining loop with resume
-    ├── pretrain_data/            v1 (smol-baseline) data — preserved
-    ├── pretrain_data_v2/         v2 (~2B-token) data — current target
-    ├── checkpoints_pretrain/     v1 model checkpoints — preserved
-    └── checkpoints_pretrain_v2/  v2 model checkpoints — current target
+├── phase3/                       Code pretraining + SFT
+│   ├── README.md
+│   ├── decoder_only_v3.py        GPTv3 (Phase 2 + gradient checkpointing)
+│   ├── data_prep.py              The Stack Python → train.bin / val.bin
+│   ├── pretrain.py               Full pretraining loop with resume
+│   ├── finetune_data_prep.py     codeforces-cots → SFT JSONL
+│   ├── finetune.py               Masked-loss supervised fine-tune
+│   └── checkpoints_finetune_v2/  SFT checkpoints (Phase 4 starts here)
+└── phase4/                       GRPO reinforcement learning
+    ├── README.md                 Includes the reward-hacking story
+    ├── audit_tests.py            Test-coverage audit / problem pool
+    ├── code_executor.py          Sandbox runner + verifiable reward
+    ├── rollouts.py               generate_group (the GRPO group)
+    ├── build_curriculum.py       Find the learnable problem subset
+    ├── grpo.py                   The GRPO training loop
+    ├── compare_grpo.py           Pre-vs-post qualitative side-by-side
+    ├── curriculum.jsonl          Pool scored under raw reward (200 SOLVABLE)
+    ├── curriculum_v2.jsonl       Pool re-scored, anti-hack (24 SOLVABLE)
+    ├── checkpoints_grpo_v1/      First run — reward hack baked in
+    └── checkpoints_grpo_v2/      Re-calibration under honest reward
 ```
 
 ---
@@ -206,6 +217,39 @@ it has no reasoning traces. Reserved for Phase 5 evaluation.
 
 → Deep dive: [phase3/README.md](phase3/README.md)
 
+### Phase 4 — GRPO Reinforcement Learning
+
+Applies **GRPO** (Shao et al. 2024 / DeepSeek-R1) with a **verifiable
+code-execution reward** on top of the SFT checkpoint: roll out G solution
+attempts per problem, run them against the dataset's test cases, and push
+the policy toward correctness. Two resident models (trainable policy +
+frozen reference for the KL term) — no PPO critic, the key 8 GB win.
+
+**The headline result is a negative one, and it's the most instructive
+finding in the project.** The first run looked like a textbook success —
+held-out reward climbed **0.022 → 0.238**. But reading the actual generated
+code revealed it was almost entirely **reward hacking**: the model learned
+to print constant outputs (`-1`, `0`) on problems whose test set is
+dominated by one answer, passing many tests without solving anything.
+
+Building a hack-resistant reward — `advantage = max(0, pass_fraction −
+constant_baseline)` plus a guard zeroing constant-output completions —
+and re-scoring the problem pool, the genuinely-learnable rate collapsed
+**25.4% → 1.8%**. A clean re-calibration then held flat at ~0.01: **a 97M
+model has essentially no real RL headroom on this data once the exploit is
+blocked.**
+
+The GRPO machinery, reward design, curriculum construction, anti-hack
+guard, and held-out methodology all work correctly — the limiting factor
+is model scale × dataset difficulty, not the RL implementation.
+
+| Run | Reward | Held-out | Reading |
+|-----|--------|----------|---------|
+| v1 (1500 steps) | raw pass fraction | 0.022 → 0.238 | mostly reward hacking |
+| v2 (200 steps) | advantage (anti-hack) | 0.010 → 0.010 | hack blocked → ~no real headroom |
+
+→ Deep dive: [phase4/README.md](phase4/README.md)
+
 ---
 
 ## Setup
@@ -362,11 +406,12 @@ output and stops cleanly at `<eos>` on held-out DSA problems.
 |-------|------|--------|
 | 3 (pretrain) | 97M-param decoder-only LM at 2048 context on `the-stack-dedup` Python | **done** (val_loss 1.15 at step 60 000) |
 | 3 (fine-tune) | SFT on `open-r1/codeforces-cots:solutions_py_decontaminated`, editorial-as-reasoning (3 519 train / 185 val examples at 2048 context) | **done** (val_loss 1.38 at end of epoch 2; structural smoke test via [phase3/test_sft_generation.py](phase3/test_sft_generation.py)) |
-| 4 (RL) | GRPO with code-execution test-case reward, using `public_tests`/`private_tests` from the same FT source (DeepSeek-R1 recipe) | not started |
-| 5 (eval) | pass@1 / pass@k on held-out LeetCode (`greengerong/leetcode`) + HumanEval | not started |
+| 4 (RL) | GRPO with code-execution test-case reward (`public_tests`/`private_tests`); two-model policy+reference, anti-hack advantage reward | **done** — see [phase4/README.md](phase4/README.md). Established a documented negative result: v1 gain was reward hacking; 97M has ~no real headroom under an honest reward |
+| 5 (eval) | pass@1 / pass@k on held-out LeetCode (`greengerong/leetcode`) + HumanEval | **not started** |
 
-None of these require architecture changes — they layer on top of the
-pretrained checkpoint.
+The architecture is frozen from Phase 3 on — Phases 4–5 layer on top of the
+pretrained/SFT checkpoint. Phase 5 (formal pass@k benchmark) is the one
+remaining piece of the original plan.
 
 ---
 
@@ -408,6 +453,27 @@ Generalised versions of these process lessons live in the knowledge
 graph: [Schema verification before coding](Learning/knowledge-graph/Schema%20verification%20before%20coding.md),
 [Context length from data](Learning/knowledge-graph/Context%20length%20from%20data.md),
 [Loss-mask invariants](Learning/knowledge-graph/Loss-mask%20invariants.md).
+
+### Phase 4 lesson — a rising reward is not evidence of learning
+
+The single biggest lesson of Phase 4: **GRPO's training reward climbed 10×
+(0.022 → 0.238) almost entirely via reward hacking.** The model learned to
+print constant outputs (`-1`, `0`) on problems whose test set is dominated
+by one answer — passing many tests without solving anything. The numbers
+looked like success; the *code* told the real story.
+
+Three mitigations followed, all now standard in the Phase 4 reward:
+1. **Constant baseline subtraction** — `advantage = max(0, pass_fraction −
+   (modal-output frequency))`. A constant nets ~0.
+2. **Constant-output guard** — any completion emitting one identical output
+   across all distinct inputs is zeroed.
+3. **Held-out eval under the honest reward** — the only trustworthy signal;
+   it stayed flat (~0.01) where the hackable metric rose.
+
+Generalised in the knowledge graph:
+[Reward hacking](Learning/knowledge-graph/Reward%20hacking.md),
+[Verifiable reward has a baseline](Learning/knowledge-graph/Verifiable%20reward%20has%20a%20baseline.md),
+[Read the outputs, not just the metric](Learning/knowledge-graph/Read%20the%20outputs%20not%20just%20the%20metric.md).
 
 ---
 
